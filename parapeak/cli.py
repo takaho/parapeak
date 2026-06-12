@@ -1,0 +1,69 @@
+import argparse
+
+
+def create_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog='parapeak',
+        description=(
+            'ChIP-seq peak caller with parallel computation and GC-corrected statistics. '
+            'Compatible with BAM/SAM input. Genome size is inferred from BAM headers.'
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    inp = parser.add_argument_group('Input')
+    inp.add_argument(
+        '-t', '--treated', nargs='+', required=True, metavar='BAM',
+        help='Treated BAM/SAM files (indexed .bai required for BAM)',
+    )
+    inp.add_argument(
+        '-c', '--control', nargs='+', default=None, metavar='BAM',
+        help='Control/input BAM/SAM files',
+    )
+    inp.add_argument(
+        '--blacklist', default=None, metavar='BED',
+        help='Blacklist BED file (plain or gzip-compressed)',
+    )
+
+    out = parser.add_argument_group('Output')
+    out.add_argument(
+        '-o', '--output', default='parapeak_output', metavar='DIR',
+        help='Output directory',
+    )
+    out.add_argument(
+        '-n', '--name', default='parapeak', metavar='NAME',
+        help='Output file prefix',
+    )
+
+    param = parser.add_argument_group('Algorithm parameters')
+    param.add_argument(
+        '--local-window', type=int, default=1000, metavar='BP',
+        help='Local background window size in bp',
+    )
+    param.add_argument(
+        '--fragment-size', type=int, default=None, metavar='BP',
+        help='Fragment size for read extension. '
+             'Estimated from paired-end insert size if not given; falls back to 200.',
+    )
+    param.add_argument(
+        '--bin-size', type=int, default=10, metavar='BP',
+        help='Bin size for pileup in bp',
+    )
+    param.add_argument(
+        '-q', '--qvalue', type=float, default=0.05, metavar='FLOAT',
+        help='Q-value threshold for both NB and Z-score methods',
+    )
+    param.add_argument(
+        '--min-length', type=int, default=200, metavar='BP',
+        help='Minimum peak length in bp',
+    )
+    param.add_argument(
+        '--max-gap', type=int, default=30, metavar='BP',
+        help='Maximum gap between significant bins for merging',
+    )
+    param.add_argument(
+        '-p', '--threads', type=int, default=1, metavar='INT',
+        help='Number of parallel worker processes',
+    )
+
+    return parser
