@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "parapeak"
+version = "0.1.0"
+description = "ChIP-seq peak caller with parallel computation and GC-corrected statistics"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Takaho A. Endo", email = "ssssrabbit@gmail.com" }
+]
+keywords = ["bioinformatics", "ChIP-seq", "peak-calling", "genomics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "pysam>=0.21",
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "numba>=0.58",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov"]
+
+[project.urls]
+Homepage = "https://github.com/takaho/parapeak"
+Repository = "https://github.com/takaho/parapeak"
+"Bug Tracker" = "https://github.com/takaho/parapeak/issues"
+
+[project.scripts]
+parapeak = "parapeak.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["parapeak*"]

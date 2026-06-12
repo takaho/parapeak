@@ -85,3 +85,6 @@ parapeak_output/
 
 # Credentials
 token.txt
+dist/
+build/
+*.egg-info/
