@@ -5,13 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "parapeak"
 version = "0.1.0"
-description = "ChIP-seq peak caller with parallel computation and GC-corrected statistics"
+description = "NGS peak caller with parallel computation and GC-corrected statistics"
 readme = "README.md"
 license = "MIT"
 authors = [
     { name = "Takaho A. Endo", email = "ssssrabbit@gmail.com" }
 ]
-keywords = ["bioinformatics", "ChIP-seq", "peak-calling", "genomics"]
+keywords = ["bioinformatics", "NGS", "peak-calling", "genomics"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",

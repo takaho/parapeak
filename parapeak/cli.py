@@ -5,7 +5,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='parapeak',
         description=(
-            'ChIP-seq peak caller with parallel computation and GC-corrected statistics. '
+            'NGS peak caller with parallel computation and GC-corrected statistics. '
             'Compatible with BAM/SAM input. Genome size is inferred from BAM headers.'
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,

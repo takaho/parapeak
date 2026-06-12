@@ -1,6 +1,6 @@
 # parapeak
 
-A ChIP-seq peak caller featuring parallel-by-chromosome computation, blacklist exclusion, and a dual statistical framework (negative binomial + GC-corrected Z-score).
+An NGS peak caller featuring parallel-by-chromosome computation, blacklist exclusion, and a dual statistical framework (negative binomial + GC-corrected Z-score).
 
 **parapeak** is inspired by [MACS3](https://github.com/macs3-project/MACS) but differs in several key aspects:
 
@@ -32,7 +32,7 @@ Dependencies: `pysam`, `numpy`, `scipy`, `numba`
 ## Quick start
 
 ```bash
-# Single-end ChIP-seq with input control and blacklist
+# Single-end NGS with input control and blacklist
 parapeak -t ChIP.bam -c Input.bam \
          --blacklist hg38-blacklist.v2.bed.gz \
          -o results/ -n H3K27ac -p 8
