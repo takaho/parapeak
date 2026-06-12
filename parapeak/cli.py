@@ -6,7 +6,9 @@ def create_parser() -> argparse.ArgumentParser:
         prog='parapeak',
         description=(
             'NGS peak caller with parallel computation and GC-corrected statistics. '
-            'Compatible with BAM/SAM input. Genome size is inferred from BAM headers.'
+            'Supports shallow (MiSeq) to deep coverage across ATAC-seq, '
+            'genome-editing assays (CIRCLE-seq, GUIDE-seq), and similar experiments. '
+            'Genome size is inferred from BAM headers; no reference FASTA required.'
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -14,7 +16,7 @@ def create_parser() -> argparse.ArgumentParser:
     inp = parser.add_argument_group('Input')
     inp.add_argument(
         '-t', '--treated', nargs='+', required=True, metavar='BAM',
-        help='Treated BAM/SAM files (indexed .bai required for BAM)',
+        help='Treated BAM/SAM files (BAM index .bai required)',
     )
     inp.add_argument(
         '-c', '--control', nargs='+', default=None, metavar='BAM',
@@ -51,7 +53,7 @@ def create_parser() -> argparse.ArgumentParser:
     )
     param.add_argument(
         '-q', '--qvalue', type=float, default=0.05, metavar='FLOAT',
-        help='Q-value threshold for both NB and Z-score methods',
+        help='Q-value threshold applied to both NB and Z-score methods',
     )
     param.add_argument(
         '--min-length', type=int, default=200, metavar='BP',
@@ -61,7 +63,47 @@ def create_parser() -> argparse.ArgumentParser:
         '--max-gap', type=int, default=30, metavar='BP',
         help='Maximum gap between significant bins for merging',
     )
-    param.add_argument(
+
+    filter_group = parser.add_argument_group(
+        'Signal filters',
+        description=(
+            'Post-statistical filters on absolute signal strength. '
+            'These are especially important for low-coverage (MiSeq) data '
+            'where statistical tests alone can pass spurious peaks caused '
+            'by stochastic zero-count control bins.'
+        ),
+    )
+    filter_group.add_argument(
+        '--min-count', type=float, default=5.0, metavar='FLOAT',
+        help=(
+            'Minimum pileup value at the peak summit after read extension. '
+            'Peaks whose summit bin contains fewer than this many overlapping '
+            'extended reads are discarded. '
+            'Increase for shallow libraries (e.g., 3 for MiSeq, 10 for deep data).'
+        ),
+    )
+    filter_group.add_argument(
+        '--min-fold', type=float, default=2.0, metavar='FLOAT',
+        help=(
+            'Minimum fold enrichment over the pseudocount-corrected background. '
+            'Applied after --pseudocount is added to the denominator, '
+            'so fold = (treated + pc) / (scaled_control + pc). '
+            'Values < 1 disable this filter.'
+        ),
+    )
+    filter_group.add_argument(
+        '--pseudocount', type=float, default=1.0, metavar='FLOAT',
+        help=(
+            'Pseudocount (in units of reads per local-window) added to the '
+            'control background before NB modelling and fold-enrichment '
+            'calculation. Prevents zero-control regions from producing '
+            'infinite fold enrichment and stabilises the NB background '
+            'estimate at low coverage. Higher values make the caller more '
+            'conservative in zero-control regions.'
+        ),
+    )
+
+    parser.add_argument(
         '-p', '--threads', type=int, default=1, metavar='INT',
         help='Number of parallel worker processes',
     )

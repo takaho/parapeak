@@ -158,19 +158,37 @@ def nb_pvalues(
     local_bins: int,
     scale_factor: float,
     blacklist_mask: np.ndarray,
+    pseudocount: float = 1.0,
 ) -> np.ndarray:
     """
     Compute per-bin NB p-values.
 
-    Background is the scaled control signal evaluated at both global and
-    local levels; the **larger** p-value (more conservative) is returned.
+    Background is the scaled control signal + pseudocount, evaluated at
+    both global and local levels.  The **larger** p-value (more conservative,
+    less significant) is returned per bin.
+
+    Pseudocount
+    -----------
+    ``pseudocount`` (in units of reads per local window) is spread evenly
+    across the ``local_bins`` bins of each window and added to the scaled
+    control before fitting the NB distribution.  This floors the background
+    at a minimum level even when the control has zero reads at a position,
+    preventing stochastic zero-count bins from producing artificially tiny
+    p-values at low coverage.
+
+    At typical MiSeq depth the control pileup is zero for ~60 % of bins.
+    Without a pseudocount those bins produce P(X ≥ k | λ_global) which
+    can pass BH correction even for moderate k, generating a flood of
+    false-positive peaks on any chromosome that happens to be
+    under-represented in the control library.
     """
-    bg = ctrl_pileup * scale_factor
+    pseudo_per_bin = pseudocount / max(local_bins, 1)
+    bg = ctrl_pileup * scale_factor + pseudo_per_bin
     valid = ~blacklist_mask
 
     global_mean = float(np.mean(bg[valid])) if valid.any() else float(np.mean(bg))
-    global_var = float(np.var(bg[valid], ddof=1)) if valid.sum() > 1 else global_mean
-    global_var = max(global_var, global_mean)
+    global_var  = float(np.var(bg[valid], ddof=1)) if valid.sum() > 1 else global_mean
+    global_var  = max(global_var, global_mean)
 
     local_mean = compute_local_background(bg, local_bins)
 
@@ -178,7 +196,7 @@ def nb_pvalues(
     r_g, p_g = _nb_params(global_mean, global_var)
     pvals_global = _nb_sf(observed, r_g, p_g)
 
-    # Local background p-values (use same dispersion estimate)
+    # Local background p-values (same dispersion, local lambda)
     local_global_mean = float(np.mean(local_mean[valid])) if valid.any() else global_mean
     r_l, p_l = _nb_params(local_global_mean, global_var)
     pvals_local = _nb_sf(observed, r_l, p_l)

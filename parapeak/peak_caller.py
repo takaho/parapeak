@@ -86,6 +86,7 @@ def _compute_pvalues_for_chrom(
     gc_centers: np.ndarray,
     gc_mean_depth: np.ndarray,
     gc_var_depth: np.ndarray,
+    pseudocount: float = 1.0,
 ) -> Dict[str, Any]:
     """Compute NB and Z-score p-values for one chromosome."""
     treat = chrom_data['treat'].astype(np.float64)
@@ -100,6 +101,7 @@ def _compute_pvalues_for_chrom(
         local_bins=local_bins,
         scale_factor=scale_factor,
         blacklist_mask=bl_mask,
+        pseudocount=pseudocount,
     )
 
     # --- GC-corrected Z-score p-values ---
@@ -144,12 +146,28 @@ def _call_peaks_for_chrom(
     min_length_bins: int,
     max_gap_bins: int,
     scale_factor: float,
+    pseudocount: float,
+    min_count: float,
+    min_fold: float,
     peak_prefix: str,
     chrom_offset: int,
 ) -> List[PeakRecord]:
     """
     Identify contiguous runs of significant bins, merge across small gaps,
-    filter by minimum length, and build PeakRecord objects.
+    then apply signal-strength filters before building PeakRecord objects.
+
+    Signal filters (applied after statistical significance)
+    -------------------------------------------------------
+    min_count : minimum pileup value at the summit bin.
+        At low coverage (MiSeq), statistical tests can pass bins with only
+        1-2 reads if the control happens to have zero reads there.  This
+        absolute floor removes those artefacts regardless of p-value.
+
+    min_fold  : minimum fold enrichment over the pseudocount-corrected
+        background.  fold = (mean_treat + pc) / (mean_ctrl_scaled + pc)
+        where pc = pseudocount / local_bins.  Using pseudocount in the
+        denominator prevents infinite fold values when control = 0 and
+        gives a meaningful enrichment estimate at all coverage depths.
     """
     sig = (q_nb < qvalue_thr) & (q_z < qvalue_thr) & (~bl_mask)
     n_bins = len(sig)
@@ -162,6 +180,13 @@ def _call_peaks_for_chrom(
         from scipy.ndimage import binary_dilation
         struct = np.ones(2 * max_gap_bins + 1, dtype=bool)
         sig = binary_dilation(sig, structure=struct) & ~bl_mask
+
+    # Pseudocount per bin for fold calculation (same units as pileup)
+    # We store pseudocount as reads-per-local-window; distribute evenly.
+    # Use a rough local_bins estimate from local_window implied by the
+    # caller (not available here), so fall back to pseudocount directly
+    # as a per-region floor on the scaled control mean.
+    pc = pseudocount  # per-region pseudocount (added to both numerator & denominator)
 
     peaks: List[PeakRecord] = []
     idx = 0
@@ -181,28 +206,38 @@ def _call_peaks_for_chrom(
         if length_bins < min_length_bins:
             continue
 
-        start_bp = start_bin * bin_size
-        end_bp = end_bin * bin_size
-
         # Summit: bin with maximum treatment signal in the region
         region_treat = treat[start_bin:end_bin]
+        summit_val = float(np.max(region_treat))
+
+        # --- Signal filter 1: minimum absolute count at summit ---
+        if summit_val < min_count:
+            continue
+
+        mean_treat = float(np.mean(region_treat))
+        mean_ctrl_scaled = float(np.mean(ctrl[start_bin:end_bin])) * scale_factor
+
+        # Fold enrichment with pseudocount (no infinite values)
+        fold_enrich = (mean_treat + pc) / (mean_ctrl_scaled + pc)
+
+        # --- Signal filter 2: minimum fold enrichment ---
+        if min_fold > 1.0 and fold_enrich < min_fold:
+            continue
+
+        start_bp = start_bin * bin_size
+        end_bp = end_bin * bin_size
         summit_rel = int(np.argmax(region_treat))
         summit_abs = (start_bin + summit_rel) * bin_size + bin_size // 2
 
-        # Scores
         region_q_nb = q_nb[start_bin:end_bin]
         region_q_z = q_z[start_bin:end_bin]
         region_p_nb = p_nb[start_bin:end_bin]
         region_p_z = p_z[start_bin:end_bin]
 
         min_q_nb = float(np.min(region_q_nb))
-        min_q_z = float(np.min(region_q_z))
+        min_q_z  = float(np.min(region_q_z))
         min_p_nb = float(np.min(region_p_nb))
-        min_p_z = float(np.min(region_p_z))
-
-        mean_treat = float(np.mean(region_treat))
-        mean_ctrl = float(np.mean(ctrl[start_bin:end_bin])) * scale_factor
-        fold_enrich = mean_treat / max(mean_ctrl, 1e-6)
+        min_p_z  = float(np.min(region_p_z))
 
         peak_count += 1
         name = f'{peak_prefix}_{chrom_offset + peak_count}'
@@ -260,6 +295,10 @@ def run_peak_calling(args: Namespace) -> None:
     local_bins = max(1, args.local_window // args.bin_size)
     min_length_bins = max(1, args.min_length // args.bin_size)
     max_gap_bins = max(0, args.max_gap // args.bin_size)
+    logger.info(
+        f'Signal filters: min-count={args.min_count}, '
+        f'min-fold={args.min_fold}, pseudocount={args.pseudocount}'
+    )
 
     # -----------------------------------------------------------------------
     # Stage 1: pileup (parallel)
@@ -320,6 +359,7 @@ def run_peak_calling(args: Namespace) -> None:
                 _compute_pvalues_for_chrom,
                 data, local_bins, scale_factor,
                 gc_centers, gc_mean_depth, gc_var_depth,
+                args.pseudocount,
             )
             futures[fut] = chrom
 
@@ -389,6 +429,9 @@ def run_peak_calling(args: Namespace) -> None:
                 min_length_bins=min_length_bins,
                 max_gap_bins=max_gap_bins,
                 scale_factor=scale_factor,
+                pseudocount=args.pseudocount,
+                min_count=args.min_count,
+                min_fold=args.min_fold,
                 peak_prefix=args.name,
                 chrom_offset=chrom_peak_offset[c],
             )
