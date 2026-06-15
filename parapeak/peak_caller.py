@@ -330,32 +330,71 @@ def run_peak_calling(args: Namespace) -> None:
                 logger.warning(f'  P-value computation failed for {chrom}: {exc}')
 
     # -----------------------------------------------------------------------
-    # Stage 3: genome-wide BH correction (sequential)
+    # Stage 3: BH correction over non-zero-pileup bins only (sequential)
     # -----------------------------------------------------------------------
-    logger.info('Applying Benjamini-Hochberg correction genome-wide')
+    # Zero-pileup bins always have p = 1.0 and can never be significant.
+    # Including them in the BH denominator inflates the multiple-testing
+    # penalty by up to 100–300× without contributing any discoveries.
+    # We correct only over bins with at least one mapped read, then assign
+    # q = 1.0 to the remainder.
+    logger.info('Applying Benjamini-Hochberg correction (non-zero bins)')
     chrom_order = sorted(chrom_pvals.keys())
 
-    p_nb_all = np.concatenate([chrom_pvals[c]['p_nb'] for c in chrom_order])
-    p_z_all  = np.concatenate([chrom_pvals[c]['p_z']  for c in chrom_order])
+    active_masks: Dict[str, np.ndarray] = {}
+    p_nb_active: List[np.ndarray] = []
+    p_z_active:  List[np.ndarray] = []
 
-    q_nb_all = benjamini_hochberg(p_nb_all)
-    q_z_all  = benjamini_hochberg(p_z_all)
+    for c in chrom_order:
+        pv = chrom_pvals[c]
+        active = pv['treat'] > 0
+        active_masks[c] = active
+        p_nb_active.append(pv['p_nb'][active])
+        p_z_active.append(pv['p_z'][active])
+
+    p_nb_concat = np.concatenate(p_nb_active) if p_nb_active else np.array([], dtype=np.float64)
+    p_z_concat  = np.concatenate(p_z_active)  if p_z_active  else np.array([], dtype=np.float64)
+
+    q_nb_concat = benjamini_hochberg(p_nb_concat)
+    q_z_concat  = benjamini_hochberg(p_z_concat)
+
+    logger.info(
+        f'  Active bins: {len(p_nb_concat):,} / '
+        f'{sum(len(chrom_pvals[c]["p_nb"]) for c in chrom_order):,} total'
+    )
 
     pos = 0
-    split_points: List[int] = []
     for c in chrom_order:
-        split_points.append(pos)
-        pos += len(chrom_pvals[c]['p_nb'])
-    split_points.append(pos)
+        pv   = chrom_pvals[c]
+        active = active_masks[c]
+        na   = int(active.sum())
+        n    = len(pv['p_nb'])
 
-    for i, c in enumerate(chrom_order):
-        lo, hi = split_points[i], split_points[i + 1]
-        chrom_pvals[c]['q_nb'] = q_nb_all[lo:hi]
-        chrom_pvals[c]['q_z']  = q_z_all[lo:hi]
+        q_nb = np.ones(n, dtype=np.float64)
+        q_z  = np.ones(n, dtype=np.float64)
+        if na > 0:
+            q_nb[active] = q_nb_concat[pos:pos + na]
+            q_z[active]  = q_z_concat[pos:pos + na]
+        pv['q_nb'] = q_nb
+        pv['q_z']  = q_z
+        pos += na
 
     # -----------------------------------------------------------------------
     # Stage 4: peak calling (parallel)
     # -----------------------------------------------------------------------
+    # When no control was provided, ctrl == treat and fold enrichment would
+    # always be 1.0, causing every peak to fail the min_fold filter.
+    # Replace ctrl with a flat genome-mean array so fold enrichment reflects
+    # enrichment above the genome-wide background.  The NB p-values have
+    # already been computed, so this only affects fold enrichment in Stage 4.
+    if not args.control:
+        total_reads = sum(float(np.sum(chrom_pvals[c]['treat'])) for c in chrom_order)
+        total_bins  = sum(len(chrom_pvals[c]['treat'])           for c in chrom_order)
+        genome_mean = total_reads / max(total_bins, 1)
+        logger.info(f'No control: using genome mean {genome_mean:.4f} as fold-enrichment baseline')
+        for c in chrom_order:
+            n = len(chrom_pvals[c]['ctrl'])
+            chrom_pvals[c]['ctrl'] = np.full(n, genome_mean, dtype=np.float64)
+
     logger.info('Calling peaks')
     all_peaks: List[PeakRecord] = []
 
@@ -451,3 +490,7 @@ def run_peak_calling(args: Namespace) -> None:
         written.append(bw_path)
 
     logger.info('Written:\n' + '\n'.join(f'  {p}' for p in written))
+
+    logger.info(
+        f'Written:\n  {np_path}\n  {sb_path}\n  {ts_path}\n  {json_path}\n  {bg_path}'
+    )

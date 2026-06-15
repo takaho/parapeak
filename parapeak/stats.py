@@ -186,9 +186,17 @@ def nb_pvalues(
     bg = ctrl_pileup * scale_factor + pseudo_per_bin
     valid = ~blacklist_mask
 
-    global_mean = float(np.mean(bg[valid])) if valid.any() else float(np.mean(bg))
-    global_var  = float(np.var(bg[valid], ddof=1)) if valid.sum() > 1 else global_mean
-    global_var  = max(global_var, global_mean)
+    valid_bg = bg[valid] if valid.any() else bg
+    global_mean = float(np.mean(valid_bg))
+
+    # Robust variance: exclude the top 1 % of bg values so that peak-level bins
+    # do not inflate the background dispersion.  This is critical in no-control
+    # mode (ctrl = treat) where a handful of extreme bins can drive the NB to
+    # r ≪ 1, producing a near-flat survival function that BH cannot correct.
+    trim_thr = float(np.percentile(valid_bg, 99.0))
+    bg_trimmed = valid_bg[valid_bg <= trim_thr]
+    global_var = float(np.var(bg_trimmed, ddof=1)) if len(bg_trimmed) > 1 else global_mean
+    global_var = max(global_var, global_mean)
 
     local_mean = compute_local_background(bg, local_bins)
 
@@ -196,10 +204,14 @@ def nb_pvalues(
     r_g, p_g = _nb_params(global_mean, global_var)
     pvals_global = _nb_sf(observed, r_g, p_g)
 
-    # Local background p-values (same dispersion, local lambda)
-    local_global_mean = float(np.mean(local_mean[valid])) if valid.any() else global_mean
-    r_l, p_l = _nb_params(local_global_mean, global_var)
-    pvals_local = _nb_sf(observed, r_l, p_l)
+    # Local background p-values (Poisson with per-bin local lambda)
+    # Using the actual local mean at each position rather than a single global
+    # mean gives a more sensitive test for enriched regions.
+    from scipy.stats import poisson as _poisson
+    pvals_local = np.clip(
+        _poisson.sf(np.maximum(observed - 1, 0).astype(np.int64), local_mean),
+        1e-300, 1.0,
+    )
 
     # Conservative: take the larger p-value (less significant)
     pvals = np.maximum(pvals_global, pvals_local)
