@@ -88,3 +88,8 @@ token.txt
 dist/
 build/
 *.egg-info/
+
+# others
+node_modules
+package*.json
+
