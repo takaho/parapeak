@@ -17,7 +17,7 @@ and similar experiments.
 | Paired-end fragments | Fixed extension | Actual insert size from TLEN field |
 | Unsorted BAM support | Requires sorted + indexed | Single-pass; no sorting or index required |
 | Read QC filters | Basic | MAPQ threshold, QC-fail flag, duplicate/secondary/supplementary |
-| Input | BAM/SAM/BED | BAM/SAM only |
+| Input | BAM/SAM/BED | BAM/SAM only (broken headers auto-repaired) |
 
 ---
 
@@ -68,6 +68,10 @@ Input:
 Output:
   -o, --output DIR              Output directory (default: parapeak_output)
   -n, --name NAME               Output file prefix (default: parapeak)
+  --bedgraph-value TYPE         Value written to the bedGraph output.
+                                fold_enrichment (default): (treated + pc) / (scaled control + pc)
+                                pvalue: -log10 of the minimum NB / Z-score p-value per bin
+                                pileup: raw treated read count per bin
 
 Algorithm parameters:
   --local-window BP             Local background window size in bp (default: 1000)
@@ -239,6 +243,7 @@ Set to values < 1 to disable.
 | `<name>_peaks.narrowPeak` | ENCODE narrowPeak (BED6+4) | Final peak calls |
 | `<name>_summits.bed` | BED | Single-base summit positions |
 | `<name>_peaks.tsv` | TSV | All score columns for downstream analysis |
+| `<name>.bedGraph` | UCSC bedGraph | Genome-wide signal track (see `--bedgraph-value`) |
 | `<name>_run.json` | JSON | Settings and read QC statistics |
 
 The narrowPeak columns follow the
@@ -250,6 +255,24 @@ chrom  start  end  name  score  strand  signalValue  -log10(p)  -log10(q)  summi
 
 The TSV file includes separate NB and Z-score p-values and q-values for
 inspection of which statistical test is the driver for each peak.
+
+### bedGraph signal track
+
+The bedGraph file covers the full genome at the same bin resolution as the
+pileup (`--bin-size`).  Bins with zero signal and blacklisted bins are
+omitted; consecutive bins with identical values are merged into a single
+record to reduce file size.  The default value is **fold enrichment**:
+
+```
+fold = (treated_bin + pseudocount) / (scaled_control_bin + pseudocount)
+```
+
+Use `--bedgraph-value pvalue` to write −log₁₀(*p*) (minimum of the NB
+and Z-score p-values per bin), or `--bedgraph-value pileup` to write the
+raw treated read count per bin.
+
+The track is compatible with IGV, the UCSC Genome Browser, and any tool
+that accepts bedGraph format.
 
 ### JSON run report
 
@@ -275,7 +298,8 @@ reproducibility and QC review. Example:
     "min_count": 5.0,
     "min_fold": 2.0,
     "pseudocount": 1.0,
-    "threads": 8
+    "threads": 8,
+    "bedgraph_value": "fold_enrichment"
   },
   "statistics": {
     "fragment_size_used": 185,
@@ -321,6 +345,14 @@ file; on a typical human genome (25 chromosomes) this is a ~25× reduction in
 I/O for unsorted input.
 
 Blacklisted bins are zeroed after the pass completes.
+
+If pysam rejects a file due to a malformed header (e.g. duplicate `@HD`
+lines produced by some aligners or merge tools), parapeak automatically
+repairs the header: for SAM files the raw text is rewritten with duplicate
+`@HD` lines removed; for BAM files the same repair is applied after dumping
+the file to SAM text via `samtools view`.  The fixed content is written to
+a temporary file, read, and then deleted.  If repair fails, the file is
+skipped with a warning and the run continues with the remaining inputs.
 
 ### 2. GC correction model
 

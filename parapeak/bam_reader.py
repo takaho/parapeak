@@ -35,8 +35,12 @@ QC filters applied per read (in order)
 6. mapping_quality < min_mapq
 7. is_read2    (skip to avoid double-counting; not a quality filter)
 """
+import contextlib
 import logging
-from typing import Dict, List, Optional, Tuple
+import os
+import subprocess
+import tempfile
+from typing import Dict, Generator, List, Optional, Tuple
 
 import numpy as np
 import pysam
@@ -48,6 +52,91 @@ _MAX_FRAGMENT = 2000  # bp  – larger inserts are likely chimeric/discordant
 
 
 # ---------------------------------------------------------------------------
+# Tolerant BAM/SAM opener (header repair)
+# ---------------------------------------------------------------------------
+
+def _fix_sam_header_lines(lines: List[str]) -> List[str]:
+    """Return header lines with duplicate @HD entries removed."""
+    hd_seen = False
+    fixed: List[str] = []
+    for line in lines:
+        if line.startswith('@HD'):
+            if hd_seen:
+                logger.debug('Removed duplicate @HD line from header')
+                continue
+            hd_seen = True
+        fixed.append(line)
+    if not hd_seen:
+        fixed.insert(0, '@HD\tVN:1.0\tSO:unknown\n')
+    return fixed
+
+
+def _write_repaired_sam(path: str, mode: str) -> str:
+    """
+    Read a BAM/SAM whose header pysam rejected, repair it, write to a temp SAM
+    file, and return its path.  Caller is responsible for deleting the file.
+    BAM files require ``samtools`` on PATH.
+    """
+    if mode == 'rb':
+        result = subprocess.run(
+            ['samtools', 'view', '-h', path],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f'samtools view failed on {path}: {result.stderr.strip()}'
+            )
+        all_lines = result.stdout.splitlines(keepends=True)
+    else:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            all_lines = f.readlines()
+
+    header_lines = _fix_sam_header_lines([l for l in all_lines if l.startswith('@')])
+    body_lines   = [l for l in all_lines if not l.startswith('@')]
+
+    fd, tmp_path = tempfile.mkstemp(suffix='.sam')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.writelines(header_lines)
+            f.writelines(body_lines)
+    except Exception:
+        os.unlink(tmp_path)
+        raise
+    return tmp_path
+
+
+@contextlib.contextmanager
+def _open_alignment_file(
+    path: str, mode: str
+) -> Generator[pysam.AlignmentFile, None, None]:
+    """
+    Context manager that opens a BAM/SAM file with pysam, falling back to
+    header repair (temp SAM) when pysam rejects the original header.
+    """
+    tmp_path: Optional[str] = None
+    bam: Optional[pysam.AlignmentFile] = None
+    try:
+        bam = pysam.AlignmentFile(path, mode)
+    except Exception as exc:
+        logger.warning(
+            '%s: pysam rejected header (%s); attempting header repair', path, exc
+        )
+        tmp_path = _write_repaired_sam(path, mode)
+        bam = pysam.AlignmentFile(tmp_path, 'r')
+
+    try:
+        yield bam
+    finally:
+        if bam is not None:
+            bam.close()
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Header utilities
 # ---------------------------------------------------------------------------
 
@@ -56,9 +145,12 @@ def get_chromosome_sizes(bam_files: List[str]) -> Dict[str, int]:
     sizes: Dict[str, int] = {}
     for path in bam_files:
         mode = 'r' if path.endswith('.sam') else 'rb'
-        with pysam.AlignmentFile(path, mode) as bam:
-            for ref, length in zip(bam.references, bam.lengths):
-                sizes[ref] = max(sizes.get(ref, 0), length)
+        try:
+            with _open_alignment_file(path, mode) as bam:
+                for ref, length in zip(bam.references, bam.lengths):
+                    sizes[ref] = max(sizes.get(ref, 0), length)
+        except Exception as exc:
+            logger.warning('Cannot read header from %s: %s', path, exc)
     return sizes
 
 
@@ -78,13 +170,16 @@ def estimate_fragment_size(
         if len(inserts) >= n_reads:
             break
         mode = 'r' if path.endswith('.sam') else 'rb'
-        with pysam.AlignmentFile(path, mode) as bam:
-            for read in bam.fetch():
-                if len(inserts) >= n_reads:
-                    break
-                if (read.is_proper_pair and not read.is_read2
-                        and min_fragment < read.template_length <= max_fragment):
-                    inserts.append(read.template_length)
+        try:
+            with _open_alignment_file(path, mode) as bam:
+                for read in bam.fetch(until_eof=True):
+                    if len(inserts) >= n_reads:
+                        break
+                    if (read.is_proper_pair and not read.is_read2
+                            and min_fragment < read.template_length <= max_fragment):
+                        inserts.append(read.template_length)
+        except Exception as exc:
+            logger.warning('Cannot read %s for fragment size estimation: %s', path, exc)
 
     if not inserts:
         logger.warning('No paired-end reads found; using default fragment size of 200 bp')
@@ -224,7 +319,7 @@ def build_all_pileups(
     for path in bam_files:
         mode = 'r' if path.endswith('.sam') else 'rb'
         try:
-            with pysam.AlignmentFile(path, mode) as bam:
+            with _open_alignment_file(path, mode) as bam:
                 for read in bam.fetch(until_eof=True):
                     stats['total_reads'] += 1
 

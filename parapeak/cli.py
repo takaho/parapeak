@@ -37,6 +37,18 @@ def create_parser() -> argparse.ArgumentParser:
         '-n', '--name', default='parapeak', metavar='NAME',
         help='Output file prefix',
     )
+    out.add_argument(
+        '--bedgraph-value',
+        choices=['fold_enrichment', 'pvalue', 'pileup'],
+        default='fold_enrichment',
+        metavar='TYPE',
+        help=(
+            'Value written to the bedGraph output. '
+            '"fold_enrichment" (default): (treated + pc) / (scaled control + pc) per bin. '
+            '"pvalue": -log10 of the minimum NB / Z-score p-value per bin. '
+            '"pileup": raw treated read count per bin.'
+        ),
+    )
 
     param = parser.add_argument_group('Algorithm parameters')
     param.add_argument(

@@ -16,7 +16,9 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Tuple
+
+import numpy as np
 
 
 @dataclass
@@ -131,6 +133,7 @@ def write_json(
         'min_fold': args.min_fold,
         'pseudocount': args.pseudocount,
         'threads': args.threads,
+        'bedgraph_value': args.bedgraph_value,
     }
 
     report = {
@@ -152,3 +155,80 @@ def write_json(
     with open(path, 'w') as fh:
         json.dump(report, fh, indent=2)
         fh.write('\n')
+
+
+# ---------------------------------------------------------------------------
+# bedGraph output
+# ---------------------------------------------------------------------------
+
+_BEDGRAPH_LABELS = {
+    'fold_enrichment': 'Fold enrichment (treated / scaled control)',
+    'pvalue':          '-log10(p-value)',
+    'pileup':          'Treated pileup (read count per bin)',
+}
+
+
+def _iter_bedgraph_records(
+    values: np.ndarray, bin_size: int, chrom_size: int
+) -> Generator[Tuple[int, int, float], None, None]:
+    """Yield (start, end, value) bedGraph records, merging consecutive equal-valued bins.
+
+    Bins with value NaN or 0 are skipped (no record emitted).
+    """
+    rounded = np.round(values.astype(np.float64), 4)
+    n = len(rounded)
+    if n == 0:
+        return
+
+    valid = ~np.isnan(rounded) & (rounded != 0.0)
+
+    breaks = np.zeros(n, dtype=bool)
+    breaks[0] = True
+    # New segment when valid-status changes OR both valid but value differs
+    breaks[1:] = (valid[1:] != valid[:-1]) | (
+        valid[1:] & valid[:-1] & (rounded[1:] != rounded[:-1])
+    )
+
+    seg_starts = np.where(breaks)[0]
+    seg_ends = np.append(seg_starts[1:], n)
+
+    for s, e in zip(seg_starts, seg_ends):
+        if not valid[s]:
+            continue
+        yield (
+            int(s) * bin_size,
+            min(int(e) * bin_size, chrom_size),
+            float(rounded[s]),
+        )
+
+
+def write_bedgraph(
+    path: str,
+    chrom_values: Dict[str, np.ndarray],
+    chrom_sizes: Dict[str, int],
+    bin_size: int,
+    chrom_order: List[str],
+    name: str = 'parapeak',
+    value_type: str = 'fold_enrichment',
+) -> None:
+    """Write a genome-wide bedGraph file.
+
+    Parameters
+    ----------
+    chrom_values : per-chromosome float64 arrays (NaN = blacklisted / skip)
+    chrom_sizes  : chromosome lengths in bp (used to clip the last bin end)
+    bin_size     : bin width in bp
+    chrom_order  : output chromosome ordering
+    value_type   : one of 'fold_enrichment', 'pvalue', 'pileup'
+    """
+    label = _BEDGRAPH_LABELS.get(value_type, value_type)
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    with open(path, 'w') as fh:
+        fh.write(f'track type=bedGraph name="{name}" description="{label}"\n')
+        for chrom in chrom_order:
+            if chrom not in chrom_values or chrom not in chrom_sizes:
+                continue
+            for start, end, val in _iter_bedgraph_records(
+                chrom_values[chrom], bin_size, chrom_sizes[chrom]
+            ):
+                fh.write(f'{chrom}\t{start}\t{end}\t{val:.4f}\n')

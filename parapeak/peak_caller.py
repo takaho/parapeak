@@ -30,6 +30,7 @@ from parapeak.blacklist import build_blacklist_mask, parse_blacklist
 from parapeak.gc_model import fit_gc_model, predict_gc
 from parapeak.output import (
     PeakRecord,
+    write_bedgraph,
     write_json,
     write_narrowpeak,
     write_summit_bed,
@@ -408,6 +409,7 @@ def run_peak_calling(args: Namespace) -> None:
     sb_path   = os.path.join(args.output, f'{args.name}_summits.bed')
     ts_path   = os.path.join(args.output, f'{args.name}_peaks.tsv')
     json_path = os.path.join(args.output, f'{args.name}_run.json')
+    bg_path   = os.path.join(args.output, f'{args.name}.bedGraph')
 
     write_narrowpeak(all_peaks, np_path)
     write_summit_bed(all_peaks, sb_path)
@@ -422,4 +424,40 @@ def run_peak_calling(args: Namespace) -> None:
         peaks_called=len(all_peaks),
     )
 
-    logger.info(f'Written:\n  {np_path}\n  {sb_path}\n  {ts_path}\n  {json_path}')
+    # Build per-chromosome value arrays for bedGraph
+    bg_values: Dict[str, np.ndarray] = {}
+    vtype = args.bedgraph_value
+    for c in chrom_order:
+        if c not in chrom_pvals:
+            continue
+        pv = chrom_pvals[c]
+        treat_arr = pv['treat']
+        ctrl_arr  = pv['ctrl']
+        bl_mask   = pv['bl_mask']
+
+        if vtype == 'pileup':
+            vals = treat_arr.astype(np.float64)
+        elif vtype == 'pvalue':
+            min_p = np.minimum(pv['p_nb'], pv['p_z'])
+            vals = -np.log10(np.maximum(min_p, 1e-300))
+        else:  # fold_enrichment
+            pc = args.pseudocount
+            vals = (treat_arr + pc) / (ctrl_arr * scale_factor + pc)
+
+        vals = vals.astype(np.float64)
+        vals[bl_mask] = np.nan
+        bg_values[c] = vals
+
+    write_bedgraph(
+        path=bg_path,
+        chrom_values=bg_values,
+        chrom_sizes=valid_chroms,
+        bin_size=args.bin_size,
+        chrom_order=chrom_order,
+        name=args.name,
+        value_type=vtype,
+    )
+
+    logger.info(
+        f'Written:\n  {np_path}\n  {sb_path}\n  {ts_path}\n  {json_path}\n  {bg_path}'
+    )
