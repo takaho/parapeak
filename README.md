@@ -15,6 +15,8 @@ and similar experiments.
 | Blacklist | Not built-in | Applied at pileup construction time |
 | Low-coverage support | Limited | Signal filters for MiSeq-depth data |
 | Paired-end fragments | Fixed extension | Actual insert size from TLEN field |
+| Unsorted BAM support | Requires sorted + indexed | Single-pass; no sorting or index required |
+| Read QC filters | Basic | MAPQ threshold, QC-fail flag, duplicate/secondary/supplementary |
 | Input | BAM/SAM/BED | BAM/SAM only |
 
 ---
@@ -37,7 +39,7 @@ Dependencies: `pysam`, `numpy`, `scipy`, `numba`
 ## Quick start
 
 ```bash
-# Paired-end ATAC-seq (deep)
+# Paired-end ATAC-seq, unsorted BAM
 parapeak -t atac.bam --blacklist hg38-blacklist.v2.bed.gz \
          -o results/ -n ATAC -p 8
 
@@ -46,9 +48,12 @@ parapeak -t treated.bam -c ntc.bam \
          --min-count 3 --min-fold 3.0 --pseudocount 2.0 \
          -o results/ -n edit -p 8
 
-# Multiple replicates, no control
-parapeak -t rep1.bam rep2.bam -o results/ -p 4
+# Multiple replicates, stricter MAPQ filter
+parapeak -t rep1.bam rep2.bam --min-mapq 30 -o results/ -p 4
 ```
+
+BAM files do **not** need to be sorted or indexed. parapeak reads each file
+in a single sequential pass.
 
 ---
 
@@ -56,7 +61,7 @@ parapeak -t rep1.bam rep2.bam -o results/ -p 4
 
 ```
 Input:
-  -t, --treated BAM [BAM ...]   Treated BAM/SAM files (BAM index required)
+  -t, --treated BAM [BAM ...]   Treated BAM/SAM files (sorting and indexing not required)
   -c, --control BAM [BAM ...]   Control/input BAM/SAM files
   --blacklist BED               Blacklist BED file (plain or gzip-compressed)
 
@@ -74,6 +79,14 @@ Algorithm parameters:
   --min-length BP               Minimum peak length in bp (default: 200)
   --max-gap BP                  Maximum gap to merge between significant bins (default: 30)
 
+Read QC filters:
+  --min-mapq INT                Minimum mapping quality (MAPQ). Reads below this
+                                threshold are discarded (default: 20)
+  --min-fragment BP             Minimum paired-end insert size accepted from TLEN.
+                                Smaller inserts are treated as single-end (default: 10)
+  --max-fragment BP             Maximum paired-end insert size accepted from TLEN.
+                                Larger inserts are treated as single-end (default: 2000)
+
 Signal filters:
   --min-count FLOAT             Minimum pileup at the peak summit bin (default: 5)
   --min-fold FLOAT              Minimum fold enrichment over background (default: 2.0)
@@ -81,6 +94,28 @@ Signal filters:
 
   -p, --threads INT             Number of parallel worker processes (default: 1)
 ```
+
+---
+
+## Read QC filtering
+
+The following filters are applied to each read in order before it contributes
+to the pileup. Counts for each filter are reported in the JSON run report.
+
+| Filter | SAM flag / field | Default behaviour |
+|---|---|---|
+| Unmapped | `0x4` | Discarded |
+| Duplicate | `0x400` | Discarded |
+| Secondary alignment | `0x100` | Discarded |
+| Supplementary alignment | `0x800` | Discarded |
+| QC fail | `0x200` | Discarded |
+| Low mapping quality | `MAPQ < --min-mapq` | Discarded (default MAPQ < 20) |
+| Read 2 of a pair | `0x80` | Skipped (not a quality filter; avoids double-counting) |
+
+Paired-end reads that pass all filters but whose TLEN falls outside
+`[--min-fragment, --max-fragment]` are not discarded; they are treated as
+single-end reads and extended by `--fragment-size`. The count of such reads
+is reported as `insert_size_fallback` in the JSON run report.
 
 ---
 
@@ -103,7 +138,8 @@ otherwise it defaults to 200 bp.
 Only **R1** is processed; R2 is skipped to avoid double-counting fragments.
 
 For **proper pairs** whose TLEN (template length from the SAM field) falls
-within 10–2000 bp, the actual fragment interval is used directly:
+within `[--min-fragment, --max-fragment]` (default 10–2000 bp), the actual
+fragment interval is used directly:
 
 ```
 R1  5'──────────►
@@ -121,8 +157,9 @@ This is important for experiments where fragment size varies:
 - **ChIP-seq paired-end**: sonication produces a range of fragment sizes;
   actual TLEN avoids over-smoothing short fragments.
 
-For **discordant pairs** (TLEN outside 10–2000 bp) and **unpaired reads**,
-the read is treated as single-end and extended by `--fragment-size`.
+For **discordant pairs** (TLEN outside `[--min-fragment, --max-fragment]`)
+and **unpaired reads**, the read is treated as single-end and extended by
+`--fragment-size`.
 
 ---
 
@@ -202,6 +239,7 @@ Set to values < 1 to disable.
 | `<name>_peaks.narrowPeak` | ENCODE narrowPeak (BED6+4) | Final peak calls |
 | `<name>_summits.bed` | BED | Single-base summit positions |
 | `<name>_peaks.tsv` | TSV | All score columns for downstream analysis |
+| `<name>_run.json` | JSON | Settings and read QC statistics |
 
 The narrowPeak columns follow the
 [ENCODE specification](https://genome.ucsc.edu/FAQ/FAQformat.html#format12):
@@ -213,18 +251,76 @@ chrom  start  end  name  score  strand  signalValue  -log10(p)  -log10(q)  summi
 The TSV file includes separate NB and Z-score p-values and q-values for
 inspection of which statistical test is the driver for each peak.
 
+### JSON run report
+
+The JSON file records all settings and per-file read statistics for
+reproducibility and QC review. Example:
+
+```json
+{
+  "run": {
+    "timestamp": "2026-06-15T10:00:00Z",
+    "tool": "parapeak"
+  },
+  "settings": {
+    "treated": ["sample.bam"],
+    "control": null,
+    "blacklist": null,
+    "bin_size": 10,
+    "fragment_size": null,
+    "min_mapq": 20,
+    "min_fragment": 10,
+    "max_fragment": 2000,
+    "qvalue": 0.05,
+    "min_count": 5.0,
+    "min_fold": 2.0,
+    "pseudocount": 1.0,
+    "threads": 8
+  },
+  "statistics": {
+    "fragment_size_used": 185,
+    "scale_factor": 1.0,
+    "treated": {
+      "total_reads": 42000000,
+      "filtered_unmapped": 1200000,
+      "filtered_duplicate": 3500000,
+      "filtered_secondary": 80000,
+      "filtered_supplementary": 12000,
+      "filtered_qcfail": 45000,
+      "filtered_low_mapq": 2100000,
+      "skipped_read2": 17500000,
+      "insert_size_fallback": 320000,
+      "reads_used": 17243000
+    },
+    "control": null,
+    "peaks_called": 48312
+  }
+}
+```
+
 ---
 
 ## Algorithm
 
-### 1. Read pileup
+### 1. Read pileup (single-pass)
 
-Each BAM/SAM file is read with [pysam](https://pysam.readthedocs.io/).
-Chromosomes are processed in parallel (`-p` workers).
-Fragment intervals are determined as described in the
-[Single-end and paired-end handling](#single-end-and-paired-end-handling)
-section.  Each fragment adds 1 to every 10 bp bin it overlaps.
-Blacklisted bins are zeroed immediately after construction.
+Each BAM/SAM file is read in a single sequential pass using
+[pysam](https://pysam.readthedocs.io/), with no region argument.
+BAM files do not need to be sorted or indexed.
+
+For each file, numpy arrays (one per chromosome, length = chromosome size /
+bin size) are pre-allocated and held in memory. As each read is consumed from
+the stream, QC filters are applied (see [Read QC filtering](#read-qc-filtering)),
+the fragment interval is determined (see
+[Single-end and paired-end handling](#single-end-and-paired-end-handling)),
+and the corresponding bins are incremented by 1.
+
+This approach has O(N_reads) I/O cost regardless of sort order. The previous
+per-chromosome `fetch()` strategy required N_chromosomes scans of an unsorted
+file; on a typical human genome (25 chromosomes) this is a ~25× reduction in
+I/O for unsorted input.
+
+Blacklisted bins are zeroed after the pass completes.
 
 ### 2. GC correction model
 
@@ -278,7 +374,7 @@ p_Z = P(Z_standard > Z)   [one-sided upper tail]
 ### 5. Genome-wide Benjamini–Hochberg correction
 
 P-values from all chromosomes are pooled and corrected independently for
-each method:
+each method. Steps 2–5 are parallelised across chromosomes (`-p` workers).
 
 ```
 q_NB = BH(p_NB)     q_Z = BH(p_Z)
@@ -308,6 +404,10 @@ MACS3 uses a linked-list data structure internally, which limits its
 ability to parallelise across chromosomes. parapeak replaces this with
 per-chromosome NumPy arrays and Python `multiprocessing`, with
 inter-process communication only at the genome-wide BH correction step.
+
+MACS3 requires sorted and indexed BAM files for random-access region
+queries. parapeak reads each file in a single forward pass, which
+avoids this requirement and is more I/O-efficient for unsorted input.
 
 The true runtime bottleneck is BAM decompression (via the C library
 underlying pysam) and gzip decompression of the blacklist. These I/O costs

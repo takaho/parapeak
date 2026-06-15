@@ -8,7 +8,8 @@ def create_parser() -> argparse.ArgumentParser:
             'NGS peak caller with parallel computation and GC-corrected statistics. '
             'Supports shallow (MiSeq) to deep coverage across ATAC-seq, '
             'genome-editing assays (CIRCLE-seq, GUIDE-seq), and similar experiments. '
-            'Genome size is inferred from BAM headers; no reference FASTA required.'
+            'Genome size is inferred from BAM headers; no reference FASTA required. '
+            'BAM files do not need to be sorted or indexed.'
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -16,7 +17,7 @@ def create_parser() -> argparse.ArgumentParser:
     inp = parser.add_argument_group('Input')
     inp.add_argument(
         '-t', '--treated', nargs='+', required=True, metavar='BAM',
-        help='Treated BAM/SAM files (BAM index .bai required)',
+        help='Treated BAM/SAM files (sorting and indexing not required)',
     )
     inp.add_argument(
         '-c', '--control', nargs='+', default=None, metavar='BAM',
@@ -64,6 +65,22 @@ def create_parser() -> argparse.ArgumentParser:
         help='Maximum gap between significant bins for merging',
     )
 
+    qc = parser.add_argument_group('Read QC filters')
+    qc.add_argument(
+        '--min-mapq', type=int, default=20, metavar='INT',
+        help='Minimum mapping quality (MAPQ). Reads below this threshold are discarded.',
+    )
+    qc.add_argument(
+        '--min-fragment', type=int, default=10, metavar='BP',
+        help='Minimum paired-end insert size accepted from TLEN. '
+             'Smaller inserts are treated as single-end.',
+    )
+    qc.add_argument(
+        '--max-fragment', type=int, default=2000, metavar='BP',
+        help='Maximum paired-end insert size accepted from TLEN. '
+             'Larger inserts are treated as single-end.',
+    )
+
     filter_group = parser.add_argument_group(
         'Signal filters',
         description=(
@@ -94,12 +111,9 @@ def create_parser() -> argparse.ArgumentParser:
     filter_group.add_argument(
         '--pseudocount', type=float, default=1.0, metavar='FLOAT',
         help=(
-            'Pseudocount (in units of reads per local-window) added to the '
-            'control background before NB modelling and fold-enrichment '
-            'calculation. Prevents zero-control regions from producing '
-            'infinite fold enrichment and stabilises the NB background '
-            'estimate at low coverage. Higher values make the caller more '
-            'conservative in zero-control regions.'
+            'Pseudocount added to the control background before NB modelling '
+            'and fold-enrichment calculation. Prevents zero-control regions '
+            'from producing infinite fold enrichment.'
         ),
     )
 

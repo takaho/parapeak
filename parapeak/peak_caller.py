@@ -3,10 +3,14 @@ Main peak-calling pipeline.
 
 Pipeline stages
 ---------------
-Stage 1 (parallel)  : per-chromosome pileup construction
-Stage 2 (parallel)  : per-chromosome p-value computation
-Stage 3 (sequential): genome-wide BH correction (synchronisation barrier)
-Stage 4 (parallel)  : peak region calling per chromosome
+Stage 1 (sequential) : single-pass pileup construction for all chromosomes
+Stage 2 (parallel)   : per-chromosome p-value computation
+Stage 3 (sequential) : genome-wide BH correction (synchronisation barrier)
+Stage 4 (parallel)   : peak region calling per chromosome
+
+Stage 1 reads each BAM file exactly once regardless of sort order, making
+the pipeline suitable for unsorted BAM files.  Downstream stages 2 and 4
+remain fully parallelised across chromosomes.
 """
 import logging
 import math
@@ -18,61 +22,22 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from parapeak.bam_reader import (
-    build_pileup_for_chrom,
-    count_mapped_reads,
+    build_all_pileups,
     estimate_fragment_size,
     get_chromosome_sizes,
 )
 from parapeak.blacklist import build_blacklist_mask, parse_blacklist
 from parapeak.gc_model import fit_gc_model, predict_gc
-from parapeak.output import PeakRecord, write_narrowpeak, write_summit_bed, write_tsv
+from parapeak.output import (
+    PeakRecord,
+    write_json,
+    write_narrowpeak,
+    write_summit_bed,
+    write_tsv,
+)
 from parapeak.stats import benjamini_hochberg, nb_pvalues, zscore_pvalues
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Worker: pileup stage (runs in separate process)
-# ---------------------------------------------------------------------------
-
-def _pileup_worker(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """Build treated and control pileups for one chromosome."""
-    import numpy as np
-    from parapeak.bam_reader import build_pileup_for_chrom
-    from parapeak.blacklist import build_blacklist_mask, parse_blacklist
-
-    chrom = kwargs['chrom']
-    chrom_size = kwargs['chrom_size']
-    treated_bams = kwargs['treated_bams']
-    control_bams = kwargs['control_bams']
-    blacklist_file = kwargs['blacklist_file']
-    bin_size = kwargs['bin_size']
-    fragment_size = kwargs['fragment_size']
-
-    bl_regions = parse_blacklist(blacklist_file) if blacklist_file else None
-    bl_mask = build_blacklist_mask(bl_regions, chrom, chrom_size, bin_size)
-
-    treat_pileup, gc_per_bin, treat_reads = build_pileup_for_chrom(
-        treated_bams, chrom, chrom_size, bin_size, fragment_size, bl_mask
-    )
-
-    if control_bams:
-        ctrl_pileup, _, ctrl_reads = build_pileup_for_chrom(
-            control_bams, chrom, chrom_size, bin_size, fragment_size, bl_mask
-        )
-    else:
-        ctrl_pileup = treat_pileup.copy()
-        ctrl_reads = treat_reads
-
-    return {
-        'chrom': chrom,
-        'treat': treat_pileup,
-        'ctrl': ctrl_pileup,
-        'gc': gc_per_bin,
-        'bl_mask': bl_mask,
-        'treat_reads': treat_reads,
-        'ctrl_reads': ctrl_reads,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +59,6 @@ def _compute_pvalues_for_chrom(
     gc = chrom_data['gc']
     bl_mask = chrom_data['bl_mask']
 
-    # --- NB p-values ---
     p_nb = nb_pvalues(
         observed=treat,
         ctrl_pileup=ctrl,
@@ -104,9 +68,7 @@ def _compute_pvalues_for_chrom(
         pseudocount=pseudocount,
     )
 
-    # --- GC-corrected Z-score p-values ---
     expected, variance = predict_gc(gc, gc_centers, gc_mean_depth, gc_var_depth)
-    # Scale expected to match treatment depth
     expected_total = expected.sum()
     if expected_total > 0:
         expected = expected * (treat.sum() / expected_total)
@@ -114,7 +76,6 @@ def _compute_pvalues_for_chrom(
 
     p_z = zscore_pvalues(treat, expected, variance)
 
-    # Blacklisted bins get p-value = 1 (never significant)
     p_nb[bl_mask] = 1.0
     p_z[bl_mask] = 1.0
 
@@ -155,19 +116,6 @@ def _call_peaks_for_chrom(
     """
     Identify contiguous runs of significant bins, merge across small gaps,
     then apply signal-strength filters before building PeakRecord objects.
-
-    Signal filters (applied after statistical significance)
-    -------------------------------------------------------
-    min_count : minimum pileup value at the summit bin.
-        At low coverage (MiSeq), statistical tests can pass bins with only
-        1-2 reads if the control happens to have zero reads there.  This
-        absolute floor removes those artefacts regardless of p-value.
-
-    min_fold  : minimum fold enrichment over the pseudocount-corrected
-        background.  fold = (mean_treat + pc) / (mean_ctrl_scaled + pc)
-        where pc = pseudocount / local_bins.  Using pseudocount in the
-        denominator prevents infinite fold values when control = 0 and
-        gives a meaningful enrichment estimate at all coverage depths.
     """
     sig = (q_nb < qvalue_thr) & (q_z < qvalue_thr) & (~bl_mask)
     n_bins = len(sig)
@@ -175,18 +123,12 @@ def _call_peaks_for_chrom(
     if not sig.any():
         return []
 
-    # Expand gap: allow up to max_gap_bins non-significant bins between sig regions
     if max_gap_bins > 0:
         from scipy.ndimage import binary_dilation
         struct = np.ones(2 * max_gap_bins + 1, dtype=bool)
         sig = binary_dilation(sig, structure=struct) & ~bl_mask
 
-    # Pseudocount per bin for fold calculation (same units as pileup)
-    # We store pseudocount as reads-per-local-window; distribute evenly.
-    # Use a rough local_bins estimate from local_window implied by the
-    # caller (not available here), so fall back to pseudocount directly
-    # as a per-region floor on the scaled control mean.
-    pc = pseudocount  # per-region pseudocount (added to both numerator & denominator)
+    pc = pseudocount
 
     peaks: List[PeakRecord] = []
     idx = 0
@@ -196,31 +138,24 @@ def _call_peaks_for_chrom(
         if not sig[idx]:
             idx += 1
             continue
-        # Start of a significant run
         start_bin = idx
         while idx < n_bins and sig[idx]:
             idx += 1
-        end_bin = idx  # exclusive
+        end_bin = idx
 
-        length_bins = end_bin - start_bin
-        if length_bins < min_length_bins:
+        if end_bin - start_bin < min_length_bins:
             continue
 
-        # Summit: bin with maximum treatment signal in the region
         region_treat = treat[start_bin:end_bin]
         summit_val = float(np.max(region_treat))
 
-        # --- Signal filter 1: minimum absolute count at summit ---
         if summit_val < min_count:
             continue
 
         mean_treat = float(np.mean(region_treat))
         mean_ctrl_scaled = float(np.mean(ctrl[start_bin:end_bin])) * scale_factor
-
-        # Fold enrichment with pseudocount (no infinite values)
         fold_enrich = (mean_treat + pc) / (mean_ctrl_scaled + pc)
 
-        # --- Signal filter 2: minimum fold enrichment ---
         if min_fold > 1.0 and fold_enrich < min_fold:
             continue
 
@@ -230,9 +165,9 @@ def _call_peaks_for_chrom(
         summit_abs = (start_bin + summit_rel) * bin_size + bin_size // 2
 
         region_q_nb = q_nb[start_bin:end_bin]
-        region_q_z = q_z[start_bin:end_bin]
+        region_q_z  = q_z[start_bin:end_bin]
         region_p_nb = p_nb[start_bin:end_bin]
-        region_p_z = p_z[start_bin:end_bin]
+        region_p_z  = p_z[start_bin:end_bin]
 
         min_q_nb = float(np.min(region_q_nb))
         min_q_z  = float(np.min(region_q_z))
@@ -240,12 +175,11 @@ def _call_peaks_for_chrom(
         min_p_z  = float(np.min(region_p_z))
 
         peak_count += 1
-        name = f'{peak_prefix}_{chrom_offset + peak_count}'
         peaks.append(PeakRecord(
             chrom=chrom,
             start=start_bp,
             end=end_bp,
-            name=name,
+            name=f'{peak_prefix}_{chrom_offset + peak_count}',
             fold_enrichment=fold_enrich,
             neg_log10_pval_nb=-math.log10(max(min_p_nb, 1e-300)),
             neg_log10_pval_z=-math.log10(max(min_p_z, 1e-300)),
@@ -269,7 +203,6 @@ def run_peak_calling(args: Namespace) -> None:
     # --- genome sizes ---
     all_bams = args.treated + (args.control or [])
     chrom_sizes = get_chromosome_sizes(all_bams)
-    # Filter out chromosomes with no data
     valid_chroms = {c: s for c, s in chrom_sizes.items() if s > 0}
     logger.info(f'Found {len(valid_chroms)} chromosomes in BAM headers')
 
@@ -277,63 +210,86 @@ def run_peak_calling(args: Namespace) -> None:
     if args.fragment_size:
         fragment_size = args.fragment_size
     else:
-        fragment_size = estimate_fragment_size(args.treated)
+        fragment_size = estimate_fragment_size(
+            args.treated,
+            min_fragment=args.min_fragment,
+            max_fragment=args.max_fragment,
+        )
     logger.info(f'Fragment size: {fragment_size} bp')
 
-    # --- library sizes ---
-    treat_total = count_mapped_reads(args.treated)
-    ctrl_total = count_mapped_reads(args.control) if args.control else treat_total
-    if ctrl_total > 0 and treat_total > 0:
-        scale_factor = treat_total / ctrl_total
-    else:
-        scale_factor = 1.0
-    logger.info(
-        f'Reads: treated={treat_total:,}, control={ctrl_total:,}, '
-        f'scale_factor={scale_factor:.4f}'
-    )
+    # --- blacklist masks (built once, shared across pileup calls) ---
+    bl_regions = parse_blacklist(args.blacklist) if args.blacklist else None
+    blacklist_masks = {
+        chrom: build_blacklist_mask(bl_regions, chrom, size, args.bin_size)
+        for chrom, size in valid_chroms.items()
+    }
 
     local_bins = max(1, args.local_window // args.bin_size)
     min_length_bins = max(1, args.min_length // args.bin_size)
     max_gap_bins = max(0, args.max_gap // args.bin_size)
+
+    # -----------------------------------------------------------------------
+    # Stage 1: single-pass pileup construction
+    # -----------------------------------------------------------------------
+    logger.info(f'Building treated pileups (single pass over {len(args.treated)} file(s))')
+    treat_pileups, treat_gc, treat_stats = build_all_pileups(
+        bam_files=args.treated,
+        chrom_sizes=valid_chroms,
+        bin_size=args.bin_size,
+        fragment_size=fragment_size,
+        min_mapq=args.min_mapq,
+        min_fragment=args.min_fragment,
+        max_fragment=args.max_fragment,
+        blacklist_masks=blacklist_masks,
+    )
     logger.info(
-        f'Signal filters: min-count={args.min_count}, '
-        f'min-fold={args.min_fold}, pseudocount={args.pseudocount}'
+        f'  treated: {treat_stats["total_reads"]:,} total reads, '
+        f'{treat_stats["reads_used"]:,} used'
     )
 
-    # -----------------------------------------------------------------------
-    # Stage 1: pileup (parallel)
-    # -----------------------------------------------------------------------
-    chrom_items = sorted(valid_chroms.items(), key=lambda x: x[1], reverse=True)
-    worker_kwargs = [
-        {
-            'chrom': chrom,
-            'chrom_size': size,
-            'treated_bams': args.treated,
-            'control_bams': args.control,
-            'blacklist_file': args.blacklist,
-            'bin_size': args.bin_size,
-            'fragment_size': fragment_size,
-        }
-        for chrom, size in chrom_items
-    ]
+    if args.control:
+        logger.info(
+            f'Building control pileups (single pass over {len(args.control)} file(s))'
+        )
+        ctrl_pileups, ctrl_gc, ctrl_stats = build_all_pileups(
+            bam_files=args.control,
+            chrom_sizes=valid_chroms,
+            bin_size=args.bin_size,
+            fragment_size=fragment_size,
+            min_mapq=args.min_mapq,
+            min_fragment=args.min_fragment,
+            max_fragment=args.max_fragment,
+            blacklist_masks=blacklist_masks,
+        )
+        logger.info(
+            f'  control: {ctrl_stats["total_reads"]:,} total reads, '
+            f'{ctrl_stats["reads_used"]:,} used'
+        )
+    else:
+        ctrl_pileups = {c: treat_pileups[c].copy() for c in treat_pileups}
+        ctrl_gc = treat_gc
+        ctrl_stats = None
 
-    logger.info(f'Building pileups for {len(chrom_items)} chromosomes '
-                f'using {args.threads} worker(s)')
+    treat_total = treat_stats['reads_used']
+    ctrl_total = ctrl_stats['reads_used'] if ctrl_stats else treat_total
+    scale_factor = treat_total / ctrl_total if ctrl_total > 0 and treat_total > 0 else 1.0
+    logger.info(
+        f'Reads used: treated={treat_total:,}, control={ctrl_total:,}, '
+        f'scale_factor={scale_factor:.4f}'
+    )
+
+    # Assemble per-chromosome data dict
     chrom_results: Dict[str, Dict] = {}
-
-    with ProcessPoolExecutor(max_workers=args.threads) as pool:
-        futures = {pool.submit(_pileup_worker, kw): kw['chrom'] for kw in worker_kwargs}
-        for fut in as_completed(futures):
-            chrom = futures[fut]
-            try:
-                result = fut.result()
-                chrom_results[chrom] = result
-                logger.info(
-                    f'  {chrom}: {result["treat_reads"]:,} treated reads, '
-                    f'{result["ctrl_reads"]:,} control reads'
-                )
-            except Exception as exc:
-                logger.warning(f'  Skipping {chrom}: {exc}')
+    for chrom in valid_chroms:
+        if chrom not in treat_pileups:
+            continue
+        chrom_results[chrom] = {
+            'chrom': chrom,
+            'treat': treat_pileups[chrom],
+            'ctrl': ctrl_pileups[chrom],
+            'gc': treat_gc[chrom],
+            'bl_mask': blacklist_masks[chrom],
+        }
 
     if not chrom_results:
         logger.error('No chromosomes processed successfully; exiting')
@@ -376,26 +332,23 @@ def run_peak_calling(args: Namespace) -> None:
     logger.info('Applying Benjamini-Hochberg correction genome-wide')
     chrom_order = sorted(chrom_pvals.keys())
 
-    # Concatenate all p-values in chromosome order
     p_nb_all = np.concatenate([chrom_pvals[c]['p_nb'] for c in chrom_order])
-    p_z_all = np.concatenate([chrom_pvals[c]['p_z'] for c in chrom_order])
+    p_z_all  = np.concatenate([chrom_pvals[c]['p_z']  for c in chrom_order])
 
     q_nb_all = benjamini_hochberg(p_nb_all)
-    q_z_all = benjamini_hochberg(p_z_all)
+    q_z_all  = benjamini_hochberg(p_z_all)
 
-    # Split back per chromosome
-    split_points: List[int] = []
     pos = 0
+    split_points: List[int] = []
     for c in chrom_order:
-        n = len(chrom_pvals[c]['p_nb'])
         split_points.append(pos)
-        pos += n
+        pos += len(chrom_pvals[c]['p_nb'])
     split_points.append(pos)
 
     for i, c in enumerate(chrom_order):
         lo, hi = split_points[i], split_points[i + 1]
         chrom_pvals[c]['q_nb'] = q_nb_all[lo:hi]
-        chrom_pvals[c]['q_z'] = q_z_all[lo:hi]
+        chrom_pvals[c]['q_z']  = q_z_all[lo:hi]
 
     # -----------------------------------------------------------------------
     # Stage 4: peak calling (parallel)
@@ -403,12 +356,11 @@ def run_peak_calling(args: Namespace) -> None:
     logger.info('Calling peaks')
     all_peaks: List[PeakRecord] = []
 
-    # Assign offsets so peak names are globally unique
     chrom_peak_offset: Dict[str, int] = {}
     cumulative = 0
     for c in chrom_order:
         chrom_peak_offset[c] = cumulative
-        cumulative += 10_000  # generous upper bound per chrom
+        cumulative += 10_000
 
     with ProcessPoolExecutor(max_workers=args.threads) as pool:
         futures = {}
@@ -446,20 +398,28 @@ def run_peak_calling(args: Namespace) -> None:
             except Exception as exc:
                 logger.warning(f'  Peak calling failed for {c}: {exc}')
 
-    # Sort by chromosome then start
     all_peaks.sort(key=lambda pk: (pk.chrom, pk.start))
-
     logger.info(f'Total peaks called: {len(all_peaks)}')
 
     # -----------------------------------------------------------------------
     # Write output
     # -----------------------------------------------------------------------
-    np_path = os.path.join(args.output, f'{args.name}_peaks.narrowPeak')
-    sb_path = os.path.join(args.output, f'{args.name}_summits.bed')
-    ts_path = os.path.join(args.output, f'{args.name}_peaks.tsv')
+    np_path   = os.path.join(args.output, f'{args.name}_peaks.narrowPeak')
+    sb_path   = os.path.join(args.output, f'{args.name}_summits.bed')
+    ts_path   = os.path.join(args.output, f'{args.name}_peaks.tsv')
+    json_path = os.path.join(args.output, f'{args.name}_run.json')
 
     write_narrowpeak(all_peaks, np_path)
     write_summit_bed(all_peaks, sb_path)
     write_tsv(all_peaks, ts_path)
+    write_json(
+        path=json_path,
+        args=args,
+        fragment_size_used=fragment_size,
+        scale_factor=scale_factor,
+        treat_stats=treat_stats,
+        ctrl_stats=ctrl_stats,
+        peaks_called=len(all_peaks),
+    )
 
-    logger.info(f'Written:\n  {np_path}\n  {sb_path}\n  {ts_path}')
+    logger.info(f'Written:\n  {np_path}\n  {sb_path}\n  {ts_path}\n  {json_path}')

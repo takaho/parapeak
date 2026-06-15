@@ -8,10 +8,15 @@ narrowPeak (ENCODE BED6+4)
 
 summit BED
     chrom  start  end  name  score
+
+JSON run report
+    Settings, QC statistics, and summary counts.
 """
+import json
 import os
 from dataclasses import dataclass
-from typing import List
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -82,3 +87,68 @@ def write_tsv(peaks: List[PeakRecord], path: str) -> None:
                 f'{pk.neg_log10_pval_nb:.4f}\t{pk.neg_log10_pval_z:.4f}\t'
                 f'{pk.neg_log10_qval_nb:.4f}\t{pk.neg_log10_qval_z:.4f}\n'
             )
+
+
+def write_json(
+    path: str,
+    args: Any,
+    fragment_size_used: int,
+    scale_factor: float,
+    treat_stats: Dict,
+    ctrl_stats: Optional[Dict],
+    peaks_called: int,
+) -> None:
+    """
+    Write a human-readable JSON run report containing settings and statistics.
+
+    Parameters
+    ----------
+    path              : output file path
+    args              : parsed argparse Namespace
+    fragment_size_used: actual fragment size used (estimated or user-supplied)
+    scale_factor      : treat/ctrl normalisation factor
+    treat_stats       : read-count dict from build_all_pileups for treated files
+    ctrl_stats        : read-count dict from build_all_pileups for control files,
+                        or None when no control was provided
+    peaks_called      : total number of peaks in the final output
+    """
+    settings: Dict[str, Any] = {
+        'treated': args.treated,
+        'control': args.control,
+        'blacklist': args.blacklist,
+        'output': args.output,
+        'name': args.name,
+        'bin_size': args.bin_size,
+        'fragment_size': args.fragment_size,
+        'min_mapq': args.min_mapq,
+        'min_fragment': args.min_fragment,
+        'max_fragment': args.max_fragment,
+        'local_window': args.local_window,
+        'qvalue': args.qvalue,
+        'min_length': args.min_length,
+        'max_gap': args.max_gap,
+        'min_count': args.min_count,
+        'min_fold': args.min_fold,
+        'pseudocount': args.pseudocount,
+        'threads': args.threads,
+    }
+
+    report = {
+        'run': {
+            'timestamp': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'tool': 'parapeak',
+        },
+        'settings': settings,
+        'statistics': {
+            'fragment_size_used': fragment_size_used,
+            'scale_factor': round(scale_factor, 6),
+            'treated': treat_stats,
+            'control': ctrl_stats,
+            'peaks_called': peaks_called,
+        },
+    }
+
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    with open(path, 'w') as fh:
+        json.dump(report, fh, indent=2)
+        fh.write('\n')
