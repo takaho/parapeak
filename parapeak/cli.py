@@ -38,15 +38,25 @@ def create_parser() -> argparse.ArgumentParser:
         help='Output file prefix',
     )
     out.add_argument(
-        '--bedgraph-value',
+        '--signal-value',
         choices=['fold_enrichment', 'pvalue', 'pileup'],
         default='fold_enrichment',
         metavar='TYPE',
         help=(
-            'Value written to the bedGraph output. '
-            '"fold_enrichment" (default): (treated + pc) / (scaled control + pc) per bin. '
-            '"pvalue": -log10 of the minimum NB / Z-score p-value per bin. '
-            '"pileup": raw treated read count per bin.'
+            'Value written to the signal BED output for each significant peak. '
+            '"fold_enrichment" (default): mean (treated + pc) / (scaled control + pc). '
+            '"pvalue": max -log10 p-value from NB and Z-score tests at the peak. '
+            '"pileup": max treated read count at the peak summit.'
+        ),
+    )
+    out.add_argument(
+        '--bigwig-bin', type=int, default=0, metavar='BP',
+        help=(
+            'Enable bigWig pileup output and set its bin size in bp (requires pyBigWig). '
+            '0 (default) disables bigWig output. '
+            'The effective bin size is rounded up to the nearest multiple of --bin-size. '
+            'Values are treated pileup minus the genome-wide mean; '
+            'only bins with a positive signal are written.'
         ),
     )
 

@@ -30,9 +30,10 @@ from parapeak.blacklist import build_blacklist_mask, parse_blacklist
 from parapeak.gc_model import fit_gc_model, predict_gc
 from parapeak.output import (
     PeakRecord,
-    write_bedgraph,
     write_json,
     write_narrowpeak,
+    write_peak_signal_bed,
+    write_pileup_bigwig,
     write_summit_bed,
     write_tsv,
 )
@@ -187,6 +188,7 @@ def _call_peaks_for_chrom(
             neg_log10_qval_nb=-math.log10(max(min_q_nb, 1e-300)),
             neg_log10_qval_z=-math.log10(max(min_q_z, 1e-300)),
             summit_offset=summit_abs - start_bp,
+            summit_pileup=summit_val,
         ))
 
     return peaks
@@ -409,7 +411,7 @@ def run_peak_calling(args: Namespace) -> None:
     sb_path   = os.path.join(args.output, f'{args.name}_summits.bed')
     ts_path   = os.path.join(args.output, f'{args.name}_peaks.tsv')
     json_path = os.path.join(args.output, f'{args.name}_run.json')
-    bg_path   = os.path.join(args.output, f'{args.name}.bedGraph')
+    sig_path  = os.path.join(args.output, f'{args.name}_signal.bed')
 
     write_narrowpeak(all_peaks, np_path)
     write_summit_bed(all_peaks, sb_path)
@@ -423,41 +425,29 @@ def run_peak_calling(args: Namespace) -> None:
         ctrl_stats=ctrl_stats,
         peaks_called=len(all_peaks),
     )
+    write_peak_signal_bed(all_peaks, sig_path, value_type=args.signal_value)
 
-    # Build per-chromosome value arrays for bedGraph
-    bg_values: Dict[str, np.ndarray] = {}
-    vtype = args.bedgraph_value
-    for c in chrom_order:
-        if c not in chrom_pvals:
-            continue
-        pv = chrom_pvals[c]
-        treat_arr = pv['treat']
-        ctrl_arr  = pv['ctrl']
-        bl_mask   = pv['bl_mask']
+    written = [np_path, sb_path, ts_path, json_path, sig_path]
 
-        if vtype == 'pileup':
-            vals = treat_arr.astype(np.float64)
-        elif vtype == 'pvalue':
-            min_p = np.minimum(pv['p_nb'], pv['p_z'])
-            vals = -np.log10(np.maximum(min_p, 1e-300))
-        else:  # fold_enrichment
-            pc = args.pseudocount
-            vals = (treat_arr + pc) / (ctrl_arr * scale_factor + pc)
+    if args.bigwig_bin >= 1:
+        import math as _math
+        effective_bw_bin = (
+            max(1, _math.ceil(args.bigwig_bin / args.bin_size)) * args.bin_size
+        )
+        bw_path = os.path.join(args.output, f'{args.name}_pileup.bw')
+        logger.info(
+            f'Writing bigWig pileup (requested bin={args.bigwig_bin} bp, '
+            f'effective bin={effective_bw_bin} bp, subtracting genome mean)'
+        )
+        write_pileup_bigwig(
+            path=bw_path,
+            chrom_pileups=treat_pileups,
+            chrom_sizes=valid_chroms,
+            chrom_order=chrom_order,
+            bin_size=args.bin_size,
+            bigwig_bin=effective_bw_bin,
+            bl_masks=blacklist_masks,
+        )
+        written.append(bw_path)
 
-        vals = vals.astype(np.float64)
-        vals[bl_mask] = np.nan
-        bg_values[c] = vals
-
-    write_bedgraph(
-        path=bg_path,
-        chrom_values=bg_values,
-        chrom_sizes=valid_chroms,
-        bin_size=args.bin_size,
-        chrom_order=chrom_order,
-        name=args.name,
-        value_type=vtype,
-    )
-
-    logger.info(
-        f'Written:\n  {np_path}\n  {sb_path}\n  {ts_path}\n  {json_path}\n  {bg_path}'
-    )
+    logger.info('Written:\n' + '\n'.join(f'  {p}' for p in written))

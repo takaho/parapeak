@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parapeak"
-version = "0.3.0"
+version = "0.3.1"
 description = "NGS peak caller with parallel computation and GC-corrected statistics"
 readme = "README.md"
 license = "MIT"
@@ -32,6 +32,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-cov"]
+bigwig = ["pyBigWig>=0.3"]
 
 [project.urls]
 Homepage = "https://github.com/takaho/parapeak"

@@ -9,14 +9,21 @@ narrowPeak (ENCODE BED6+4)
 summit BED
     chrom  start  end  name  score
 
+signal BED (BED4)
+    chrom  start  end  value   (significant peaks only)
+
+bigWig pileup
+    per-bin pileup minus genome mean, positive values only
+
 JSON run report
     Settings, QC statistics, and summary counts.
 """
 import json
+import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -33,6 +40,7 @@ class PeakRecord:
     neg_log10_qval_nb: float
     neg_log10_qval_z: float
     summit_offset: int   # relative to start
+    summit_pileup: float
 
     @property
     def score(self) -> int:
@@ -100,20 +108,7 @@ def write_json(
     ctrl_stats: Optional[Dict],
     peaks_called: int,
 ) -> None:
-    """
-    Write a human-readable JSON run report containing settings and statistics.
-
-    Parameters
-    ----------
-    path              : output file path
-    args              : parsed argparse Namespace
-    fragment_size_used: actual fragment size used (estimated or user-supplied)
-    scale_factor      : treat/ctrl normalisation factor
-    treat_stats       : read-count dict from build_all_pileups for treated files
-    ctrl_stats        : read-count dict from build_all_pileups for control files,
-                        or None when no control was provided
-    peaks_called      : total number of peaks in the final output
-    """
+    """Write a human-readable JSON run report containing settings and statistics."""
     settings: Dict[str, Any] = {
         'treated': args.treated,
         'control': args.control,
@@ -133,7 +128,8 @@ def write_json(
         'min_fold': args.min_fold,
         'pseudocount': args.pseudocount,
         'threads': args.threads,
-        'bedgraph_value': args.bedgraph_value,
+        'signal_value': args.signal_value,
+        'bigwig_bin': args.bigwig_bin,
     }
 
     report = {
@@ -158,77 +154,116 @@ def write_json(
 
 
 # ---------------------------------------------------------------------------
-# bedGraph output
+# Signal BED output (significant peaks only)
 # ---------------------------------------------------------------------------
 
-_BEDGRAPH_LABELS = {
-    'fold_enrichment': 'Fold enrichment (treated / scaled control)',
-    'pvalue':          '-log10(p-value)',
-    'pileup':          'Treated pileup (read count per bin)',
-}
-
-
-def _iter_bedgraph_records(
-    values: np.ndarray, bin_size: int, chrom_size: int
-) -> Generator[Tuple[int, int, float], None, None]:
-    """Yield (start, end, value) bedGraph records, merging consecutive equal-valued bins.
-
-    Bins with value NaN or 0 are skipped (no record emitted).
-    """
-    rounded = np.round(values.astype(np.float64), 4)
-    n = len(rounded)
-    if n == 0:
-        return
-
-    valid = ~np.isnan(rounded) & (rounded != 0.0)
-
-    breaks = np.zeros(n, dtype=bool)
-    breaks[0] = True
-    # New segment when valid-status changes OR both valid but value differs
-    breaks[1:] = (valid[1:] != valid[:-1]) | (
-        valid[1:] & valid[:-1] & (rounded[1:] != rounded[:-1])
-    )
-
-    seg_starts = np.where(breaks)[0]
-    seg_ends = np.append(seg_starts[1:], n)
-
-    for s, e in zip(seg_starts, seg_ends):
-        if not valid[s]:
-            continue
-        yield (
-            int(s) * bin_size,
-            min(int(e) * bin_size, chrom_size),
-            float(rounded[s]),
-        )
-
-
-def write_bedgraph(
+def write_peak_signal_bed(
+    peaks: List[PeakRecord],
     path: str,
-    chrom_values: Dict[str, np.ndarray],
-    chrom_sizes: Dict[str, int],
-    bin_size: int,
-    chrom_order: List[str],
-    name: str = 'parapeak',
     value_type: str = 'fold_enrichment',
 ) -> None:
-    """Write a genome-wide bedGraph file.
+    """Write a BED4 file with one row per significant peak.
 
     Parameters
     ----------
-    chrom_values : per-chromosome float64 arrays (NaN = blacklisted / skip)
-    chrom_sizes  : chromosome lengths in bp (used to clip the last bin end)
-    bin_size     : bin width in bp
-    chrom_order  : output chromosome ordering
-    value_type   : one of 'fold_enrichment', 'pvalue', 'pileup'
+    peaks      : list of called peaks
+    path       : output file path
+    value_type : 'fold_enrichment', 'pvalue', or 'pileup'
     """
-    label = _BEDGRAPH_LABELS.get(value_type, value_type)
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     with open(path, 'w') as fh:
-        fh.write(f'track type=bedGraph name="{name}" description="{label}"\n')
-        for chrom in chrom_order:
-            if chrom not in chrom_values or chrom not in chrom_sizes:
-                continue
-            for start, end, val in _iter_bedgraph_records(
-                chrom_values[chrom], bin_size, chrom_sizes[chrom]
-            ):
-                fh.write(f'{chrom}\t{start}\t{end}\t{val:.4f}\n')
+        for pk in peaks:
+            if value_type == 'pileup':
+                val = pk.summit_pileup
+            elif value_type == 'pvalue':
+                val = max(pk.neg_log10_pval_nb, pk.neg_log10_pval_z)
+            else:  # fold_enrichment
+                val = pk.fold_enrichment
+            fh.write(f'{pk.chrom}\t{pk.start}\t{pk.end}\t{val:.4f}\n')
+
+
+# ---------------------------------------------------------------------------
+# bigWig pileup output
+# ---------------------------------------------------------------------------
+
+def write_pileup_bigwig(
+    path: str,
+    chrom_pileups: Dict[str, np.ndarray],
+    chrom_sizes: Dict[str, int],
+    chrom_order: List[str],
+    bin_size: int,
+    bigwig_bin: int,
+    bl_masks: Dict[str, np.ndarray],
+) -> None:
+    """Write a bigWig of pileup minus genome-wide mean, positive values only.
+
+    Parameters
+    ----------
+    chrom_pileups : per-chromosome treated read-count arrays at bin_size resolution
+    chrom_sizes   : chromosome lengths in bp
+    chrom_order   : output chromosome ordering (must match bigWig header)
+    bin_size      : resolution of chrom_pileups in bp
+    bigwig_bin    : output bin size in bp (default 25)
+    bl_masks      : per-chromosome boolean blacklist masks
+    """
+    try:
+        import pyBigWig
+    except ImportError:
+        raise ImportError(
+            'pyBigWig is required for bigWig output. '
+            'Install it with: pip install pyBigWig'
+        )
+
+    # Genome-wide mean from all non-blacklisted bins
+    total_sum = 0.0
+    total_count = 0
+    for c in chrom_order:
+        if c not in chrom_pileups:
+            continue
+        arr = chrom_pileups[c].astype(np.float64)
+        mask = bl_masks.get(c, np.zeros(len(arr), dtype=bool))
+        valid = arr[~mask]
+        total_sum += float(valid.sum())
+        total_count += len(valid)
+    global_mean = total_sum / total_count if total_count > 0 else 0.0
+
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    bw = pyBigWig.open(path, 'w')
+    header = [(c, chrom_sizes[c]) for c in chrom_order if c in chrom_sizes]
+    bw.addHeader(header)
+
+    for c in chrom_order:
+        if c not in chrom_pileups or c not in chrom_sizes:
+            continue
+        chrom_len = chrom_sizes[c]
+        arr = chrom_pileups[c].astype(np.float64)
+        mask = bl_masks.get(c, np.zeros(len(arr), dtype=bool))
+        arr[mask] = np.nan
+
+        n_new = math.ceil(chrom_len / bigwig_bin)
+        new_sum = np.zeros(n_new, dtype=np.float64)
+        new_cnt = np.zeros(n_new, dtype=np.int64)
+
+        orig_starts = np.arange(len(arr), dtype=np.int64) * bin_size
+        new_idx = np.minimum(orig_starts // bigwig_bin, n_new - 1)
+
+        valid_mask = ~np.isnan(arr)
+        np.add.at(new_sum, new_idx[valid_mask], arr[valid_mask])
+        np.add.at(new_cnt, new_idx[valid_mask], 1)
+
+        with np.errstate(invalid='ignore'):
+            new_mean = np.where(new_cnt > 0, new_sum / new_cnt, 0.0)
+
+        signal = new_mean - global_mean
+        pos_mask = signal > 0.0
+        if not pos_mask.any():
+            continue
+
+        j_idx = np.where(pos_mask)[0]
+        starts = (j_idx * bigwig_bin).tolist()
+        ends = [min(int(j + 1) * bigwig_bin, chrom_len) for j in j_idx]
+        vals = [float(v) for v in signal[pos_mask]]
+
+        bw.addEntries(c, starts, ends=ends, values=vals)
+
+    bw.close()
