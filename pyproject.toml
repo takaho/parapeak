@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parapeak"
-version = "0.3.3"
+version = "0.3.4"
 description = "NGS peak caller with parallel computation and GC-corrected statistics"
 readme = "README.md"
 license = "MIT"
