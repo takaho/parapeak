@@ -34,6 +34,20 @@ QC filters applied per read (in order)
 5. is_qcfail   (SAM flag 0x200)
 6. mapping_quality < min_mapq
 7. is_read2    (skip to avoid double-counting; not a quality filter)
+8. keep_dup    (coordinate-based PCR duplicate cap, see below)
+
+Coordinate-based duplicate filtering
+-------------------------------------
+The SAM duplicate flag (filter 2 above) only fires when a tool such as
+``samtools markdup``/Picard MarkDuplicates has already run on the BAM.
+Many pipelines skip that step, in which case PCR-duplicated fragments
+piling up at the exact same (chrom, start, end) coordinate are otherwise
+indistinguishable from real coverage and can masquerade as extremely
+significant peaks (fold enrichment in the hundreds at a single locus).
+
+``keep_dup`` caps how many reads/fragments are kept per exact
+(chrom, start, end) interval, mirroring macs3's ``--keep-dup`` default
+of 1 -- i.e. collapse exact duplicates regardless of the SAM flag.
 """
 import contextlib
 import logging
@@ -265,6 +279,7 @@ def _empty_stats() -> Dict:
         'filtered_low_mapq': 0,
         'skipped_read2': 0,
         'insert_size_fallback': 0,
+        'filtered_coord_duplicate': 0,
         'reads_used': 0,
     }
 
@@ -278,6 +293,7 @@ def build_all_pileups(
     min_fragment: int = _MIN_FRAGMENT,
     max_fragment: int = _MAX_FRAGMENT,
     blacklist_masks: Optional[Dict[str, np.ndarray]] = None,
+    keep_dup: int = 1,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict]:
     """
     Build binned pileups for all chromosomes in a single sequential pass
@@ -293,6 +309,8 @@ def build_all_pileups(
     min_fragment   : minimum TLEN accepted for PE fragment interval
     max_fragment   : maximum TLEN accepted for PE fragment interval
     blacklist_masks: optional {chrom: bool_array} — blacklisted bins zeroed out
+    keep_dup       : max reads/fragments kept per exact (chrom, start, end)
+                     coordinate; 0 disables this filter (see module docstring)
 
     Returns
     -------
@@ -315,6 +333,7 @@ def build_all_pileups(
     }
 
     stats = _empty_stats()
+    dup_counts: Dict[Tuple[str, int, int], int] = {}
 
     for path in bam_files:
         mode = 'r' if path.endswith('.sam') else 'rb'
@@ -360,6 +379,29 @@ def build_all_pileups(
                     )
                     if used_fallback:
                         stats['insert_size_fallback'] += 1
+
+                    if keep_dup > 0:
+                        # Dedup key: 5' position of the read + strand.
+                        # For reverse reads the 5' end is the rightmost mapped
+                        # base (reference_end); for forward reads it is the
+                        # leftmost (reference_start).  This mirrors macs3's
+                        # --keep-dup default and is appropriate for cut-site
+                        # assays (ATAC-seq, GUIDE-seq, CIRCLE-seq) where two
+                        # reads sharing the same 5' position on the same strand
+                        # represent the same physical cut event regardless of
+                        # fragment length differences from PCR slippage.
+                        if read.is_reverse:
+                            five_prime = read.reference_end or (
+                                read.reference_start + (read.query_length or 1)
+                            )
+                        else:
+                            five_prime = read.reference_start
+                        dup_key = (chrom, five_prime, read.is_reverse)
+                        seen = dup_counts.get(dup_key, 0)
+                        if seen >= keep_dup:
+                            stats['filtered_coord_duplicate'] += 1
+                            continue
+                        dup_counts[dup_key] = seen + 1
 
                     s_bin = start // bin_size
                     e_bin = min(n_bins - 1, (end - 1) // bin_size)

@@ -102,6 +102,13 @@ def create_parser() -> argparse.ArgumentParser:
         help='Maximum paired-end insert size accepted from TLEN. '
              'Larger inserts are treated as single-end.',
     )
+    qc.add_argument(
+        '--keep-dup', type=int, default=1, metavar='INT',
+        help='Maximum number of reads/fragments kept at the exact same '
+             '(chrom, start, end) coordinate. Matches macs3\'s default '
+             'behaviour of collapsing PCR duplicates that were never '
+             'marked with the SAM duplicate flag. Set to 0 to disable.',
+    )
 
     filter_group = parser.add_argument_group(
         'Signal filters',

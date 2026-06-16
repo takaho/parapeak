@@ -120,6 +120,7 @@ def write_json(
         'min_mapq': args.min_mapq,
         'min_fragment': args.min_fragment,
         'max_fragment': args.max_fragment,
+        'keep_dup': args.keep_dup,
         'local_window': args.local_window,
         'qvalue': args.qvalue,
         'min_length': args.min_length,

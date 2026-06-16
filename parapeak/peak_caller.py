@@ -244,10 +244,12 @@ def run_peak_calling(args: Namespace) -> None:
         min_fragment=args.min_fragment,
         max_fragment=args.max_fragment,
         blacklist_masks=blacklist_masks,
+        keep_dup=args.keep_dup,
     )
     logger.info(
         f'  treated: {treat_stats["total_reads"]:,} total reads, '
-        f'{treat_stats["reads_used"]:,} used'
+        f'{treat_stats["reads_used"]:,} used '
+        f'({treat_stats["filtered_coord_duplicate"]:,} coord-duplicates removed)'
     )
 
     if args.control:
@@ -263,10 +265,12 @@ def run_peak_calling(args: Namespace) -> None:
             min_fragment=args.min_fragment,
             max_fragment=args.max_fragment,
             blacklist_masks=blacklist_masks,
+            keep_dup=args.keep_dup,
         )
         logger.info(
             f'  control: {ctrl_stats["total_reads"]:,} total reads, '
-            f'{ctrl_stats["reads_used"]:,} used'
+            f'{ctrl_stats["reads_used"]:,} used '
+            f'({ctrl_stats["filtered_coord_duplicate"]:,} coord-duplicates removed)'
         )
     else:
         ctrl_pileups = {c: treat_pileups[c].copy() for c in treat_pileups}
@@ -330,15 +334,21 @@ def run_peak_calling(args: Namespace) -> None:
                 logger.warning(f'  P-value computation failed for {chrom}: {exc}')
 
     # -----------------------------------------------------------------------
-    # Stage 3: BH correction over non-zero-pileup bins only (sequential)
+    # Stage 3: BH correction (sequential)
     # -----------------------------------------------------------------------
-    # Zero-pileup bins always have p = 1.0 and can never be significant.
-    # Including them in the BH denominator inflates the multiple-testing
-    # penalty by up to 100–300× without contributing any discoveries.
-    # We correct only over bins with at least one mapped read, then assign
-    # q = 1.0 to the remainder.
-    logger.info('Applying Benjamini-Hochberg correction (non-zero bins)')
+    # We run BH over the non-zero-pileup bins only (zero bins have p = 1 and
+    # never contribute discoveries), but scale the resulting q-values so they
+    # are equivalent to running BH over all genome bins.  This matches the
+    # multiple-testing correction that all-bins BH would apply without the
+    # memory cost of sorting 300 M p-values.
+    #
+    # Scaling: q_all = q_nonzero × (n_total / n_nonzero)
+    # This is equivalent to replacing the BH denominator n_nonzero with
+    # n_total, which is the correct reference set under the global null.
+    logger.info('Applying Benjamini-Hochberg correction')
     chrom_order = sorted(chrom_pvals.keys())
+
+    n_total_bins = sum(len(chrom_pvals[c]['p_nb']) for c in chrom_order)
 
     active_masks: Dict[str, np.ndarray] = {}
     p_nb_active: List[np.ndarray] = []
@@ -354,12 +364,15 @@ def run_peak_calling(args: Namespace) -> None:
     p_nb_concat = np.concatenate(p_nb_active) if p_nb_active else np.array([], dtype=np.float64)
     p_z_concat  = np.concatenate(p_z_active)  if p_z_active  else np.array([], dtype=np.float64)
 
-    q_nb_concat = benjamini_hochberg(p_nb_concat)
-    q_z_concat  = benjamini_hochberg(p_z_concat)
+    n_nonzero = len(p_nb_concat)
+    bh_scale  = n_total_bins / max(n_nonzero, 1)
+
+    q_nb_concat = np.minimum(benjamini_hochberg(p_nb_concat) * bh_scale, 1.0)
+    q_z_concat  = np.minimum(benjamini_hochberg(p_z_concat)  * bh_scale, 1.0)
 
     logger.info(
-        f'  Active bins: {len(p_nb_concat):,} / '
-        f'{sum(len(chrom_pvals[c]["p_nb"]) for c in chrom_order):,} total'
+        f'  BH: {n_nonzero:,} active / {n_total_bins:,} total bins '
+        f'(scale {bh_scale:.1f}x)'
     )
 
     pos = 0
@@ -490,7 +503,3 @@ def run_peak_calling(args: Namespace) -> None:
         written.append(bw_path)
 
     logger.info('Written:\n' + '\n'.join(f'  {p}' for p in written))
-
-    logger.info(
-        f'Written:\n  {np_path}\n  {sb_path}\n  {ts_path}\n  {json_path}\n  {bg_path}'
-    )

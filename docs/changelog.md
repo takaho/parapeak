@@ -1,0 +1,176 @@
+# Changelog
+
+## 0.3.4 (2026-06-16)
+
+### Bug fixes
+
+#### PCR duplicate filtering (`bam_reader.py`, `cli.py`)
+
+**Problem**: The duplicate filter at pileup construction time checked only the SAM `0x400`
+(duplicate) flag.  Many pipelines skip the `samtools markdup` / Picard `MarkDuplicates` step,
+leaving the flag unset even when the library contains heavy PCR amplification.  In
+genome-editing assays (GUIDE-seq, CIRCLE-seq) with MiSeq depth, a single genomic cut site can
+be represented by hundreds to thousands of PCR-identical reads, all mapping to the exact same
+position with the same TLEN.  Without coordinate-based deduplication these pile-ups are
+interpreted as enormous enrichments and are called as peaks with fold enrichment ≥ 100–600×,
+completely swamping genuine signal.
+
+**Root cause example (BINDS122/S1)**:
+
+| Position | Reads | CIGAR | TLEN | Notes |
+|---|---|---|---|---|
+| chr1:2404835 | **835** | 151M | 204 | PCR duplicates — identical start, strand, TLEN |
+| chr1:2404835 | 2 | 90M1D61M | 204 | |
+| chr1:2404835 | 2 | 151M | 201 | |
+
+With 835 reads piling up at a single 10 bp bin the local Poisson p-value is
+≈ 10⁻¹²⁰⁰; fold enrichment ≈ 595×.  MACS3 does not call this peak because its
+default `--keep-dup 1` collapses all reads sharing a 5′ position to a single tag
+irrespective of the SAM flag.
+
+**Fix**: Added coordinate-based deduplication to `build_all_pileups()`.  After passing
+all QC filters and computing the fragment interval, the 5′ position and strand of the read
+are used as a dedup key — matching MACS3's `--keep-dup` semantics:
+
+```
+key = (chrom, reference_start,  strand=False)   # forward read (5′ = leftmost bp)
+key = (chrom, reference_end,    strand=True )   # reverse read (5′ = rightmost bp)
+```
+
+Two reads sharing the same key are treated as PCR duplicates regardless of TLEN
+differences arising from PCR slippage or trimming.  This is appropriate for cut-site
+assays (ATAC-seq, GUIDE-seq, CIRCLE-seq) where the 5′ end of each read marks an
+enzymatic cleavage event; two reads starting at the same base on the same strand
+represent the same physical event.
+
+**New CLI parameter**: `--keep-dup INT` (default: **1**).  Set to 0 to disable
+coordinate-based deduplication (e.g., when the BAM has already been through
+`samtools markdup`).
+
+**Impact (BINDS122 dataset, `--fragment-size 100 --local-window 10000`)**:
+
+| Sample | Before | After | MACS3 reference |
+|---|---|---|---|
+| S1 (no control) | 4,969 peaks | 279 peaks | 208 |
+| S4 (no control) | 983 peaks | 291 peaks | 308 |
+| S4 + S5 control | 5,667 peaks | 275 peaks | — |
+| S5 (no control) | massive | 1,416 peaks | 1,563 |
+
+Note: numbers in the "before" column are from the previous release without the
+coordinate-dedup fix; see the control-mode fix below for the full context.
+
+---
+
+#### Control-mode local background floor (`stats.py`)
+
+**Problem**: In control mode the local Poisson lambda is derived from the scaled control
+pileup.  When the control has zero reads at a position (common in MiSeq-depth libraries
+where ~60% of 10 bp bins have zero control coverage), the local lambda collapses to the
+pseudocount floor, approximately `pseudocount / local_bins ≈ 0.01`.  Any treatment signal
+at those positions — even a single extended read producing pileup = 2 — then yields a
+Poisson p-value near 10⁻¹³, passing BH correction as a highly significant peak.
+
+As a result, using a negative-control BAM (e.g., S5 as control for S4) paradoxically
+produced **more** peaks than calling S4 without a control:
+
+```
+S4 alone (no control)   → 4,969 peaks
+S4 with S5 as control   → 5,667 peaks   ← WRONG (should be fewer)
+```
+
+**Root cause**: At genomic positions where S5 has zero coverage, the local lambda is
+0.01, making even a pileup of 5 reads in S4 yield p ≈ 8 × 10⁻¹³.  Without a control,
+the same position uses the treatment pileup itself to compute the local lambda, making the
+test self-referential and therefore more conservative.
+
+**Fix**: Compute a second local mean from the treatment signal and take the maximum:
+
+```python
+local_mean_ctrl  = compute_local_background(bg, local_bins)
+local_mean_treat = compute_local_background(observed + pseudo_per_bin, local_bins)
+local_mean       = np.maximum(local_mean_ctrl, local_mean_treat)
+```
+
+This mirrors MACS3's `max(lambda_bg, lambda_local)` design: the background for any bin
+is never lower than what the treatment signal itself implies, preventing near-zero lambdas
+at control-zero positions.
+
+In no-control mode (`ctrl == treat`) the two terms are identical, so this change has
+no effect on no-control runs.
+
+**Impact**: After the fix (with the dedup fix also applied), the correct ordering is
+restored: S4 with S5 control (275 peaks) < S4 alone (291 peaks).
+
+---
+
+#### Genome-wide BH denominator scaling (`peak_caller.py`)
+
+**Problem**: The Benjamini–Hochberg correction was run over only the non-zero-pileup bins
+(those with at least one read overlapping them), treating that subset as the full multiple-
+testing reference set.  For a typical human genome at 10 bp resolution, the total number
+of bins is ≈ 300 million, whereas a MiSeq-depth library yields only 1–4 million non-zero
+bins.  Running BH on the smaller set is 75–300× too lenient: each discovery effectively
+paid a correction cost of 1/n_nonzero rather than the correct 1/n_total.
+
+**Fix**: After running BH over the non-zero bins (cheap, avoids sorting 300 M p-values),
+the resulting q-values are scaled up by `n_total / n_nonzero`:
+
+```python
+bh_scale        = n_total_bins / max(n_nonzero, 1)
+q_nb_concat     = np.minimum(benjamini_hochberg(p_nb_concat) * bh_scale, 1.0)
+q_z_concat      = np.minimum(benjamini_hochberg(p_z_concat)  * bh_scale, 1.0)
+```
+
+This is mathematically equivalent to running BH over all n_total bins where every
+zero-pileup bin is assigned p = 1, without the memory and time cost of sorting 300 M
+values.  The scale factor is logged:
+
+```
+BH: 1,231,078 active / 309,992,336 total bins (scale 251.8x)
+```
+
+---
+
+#### Removed dead reference to `bg_path` (`peak_caller.py`)
+
+A leftover `logger.info` statement at the end of `run_peak_calling()` referenced the
+variable `bg_path` from an earlier bedGraph implementation that was subsequently
+replaced.  The variable no longer exists in the current code, causing a `NameError`
+at the very end of a run (after all output files had been written successfully).
+The duplicate log statement has been removed.
+
+---
+
+### New features
+
+#### `--keep-dup` CLI parameter
+
+```
+--keep-dup INT   Maximum reads/fragments kept per exact (chrom, 5′-position, strand)
+                 coordinate.  Default: 1.  Set to 0 to disable.
+```
+
+Mirrors MACS3's `--keep-dup` semantics.  The deduplicated count is reported in the
+log and in the `filtered_coord_duplicate` field of the JSON run report.
+
+---
+
+### Recommended parameters for genome-editing assay data
+
+For GUIDE-seq, CIRCLE-seq, and similar cut-site assays where reads cluster at enzymatic
+cleavage sites (equivalent to MACS3's `--nomodel --extsize 100 --shift -50` mode):
+
+```bash
+parapeak -t treated.bam -c control.bam \
+  --fragment-size 100 \
+  --local-window 10000 \
+  -o results/ -n sample -p 4
+```
+
+`--fragment-size 100` matches MACS3's default `--extsize 100` for cut-site data.
+`--local-window 10000` matches MACS3's 10 kb local lambda window.
+
+Using the TLEN-estimated fragment size (the default for paired-end libraries) is
+appropriate for ChIP-seq and ATAC-seq where the full insert size defines the signal
+region.  For cut-site assays, the biologically relevant window is narrow (the 5′ end
+of each read marks the cut), so a smaller, fixed extension is preferred.

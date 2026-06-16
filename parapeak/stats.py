@@ -198,15 +198,27 @@ def nb_pvalues(
     global_var = float(np.var(bg_trimmed, ddof=1)) if len(bg_trimmed) > 1 else global_mean
     global_var = max(global_var, global_mean)
 
-    local_mean = compute_local_background(bg, local_bins)
+    # Local background from control signal
+    local_mean_ctrl = compute_local_background(bg, local_bins)
+
+    # Local background from treatment signal.  In no-control mode ctrl == treat
+    # so this is identical to local_mean_ctrl.  In control mode, the control can
+    # have zero coverage at positions enriched in the treatment; without this
+    # floor the local lambda collapses to pseudo_per_bin (~0.01), turning even
+    # spurious 2-read treatment pileups into highly significant bins.
+    local_mean_treat = compute_local_background(
+        observed.astype(np.float64) + pseudo_per_bin, local_bins
+    )
+
+    # Take the more conservative (larger) estimate — mirrors MACS3's
+    # max(lambda_bg, lambda_local) approach to avoid near-zero backgrounds.
+    local_mean = np.maximum(local_mean_ctrl, local_mean_treat)
 
     # Global background p-values
     r_g, p_g = _nb_params(global_mean, global_var)
     pvals_global = _nb_sf(observed, r_g, p_g)
 
     # Local background p-values (Poisson with per-bin local lambda)
-    # Using the actual local mean at each position rather than a single global
-    # mean gives a more sensitive test for enriched regions.
     from scipy.stats import poisson as _poisson
     pvals_local = np.clip(
         _poisson.sf(np.maximum(observed - 1, 0).astype(np.int64), local_mean),
