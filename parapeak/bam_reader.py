@@ -432,7 +432,8 @@ def build_all_pileups(
             gc_cnt[chrom][mask] = 0
 
         cnt = gc_cnt[chrom]
-        gc_per_bins[chrom] = np.where(cnt > 0, gc_sum[chrom] / cnt, np.nan)
+        safe_cnt = np.where(cnt > 0, cnt, 1)
+        gc_per_bins[chrom] = np.where(cnt > 0, gc_sum[chrom] / safe_cnt, np.nan)
 
     out_pileups = {c: pileups[c].astype(np.float32) for c in chrom_sizes}
     return out_pileups, gc_per_bins, stats

@@ -56,20 +56,25 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     out.add_argument(
-        '--bigwig-bin', type=int, default=0, metavar='BP',
+        '--bigwig-bin', type=int, default=25, metavar='BP',
         help=(
-            'Enable bigWig pileup output and set its bin size in bp (requires pyBigWig). '
-            '0 (default) disables bigWig output. '
+            'bigWig output bin size in bp (requires pyBigWig). '
+            'Set to 0 to disable bigWig output. '
             'The effective bin size is rounded up to the nearest multiple of --bin-size. '
-            'Values are treated pileup minus the genome-wide mean; '
-            'only bins with a positive signal are written.'
+            'Values are treated pileup minus the genome-wide mean across ALL bins above '
+            'the mean (not limited to called peaks). '
+            'If pyBigWig is not installed a warning is shown and the file is skipped.'
         ),
     )
 
     param = parser.add_argument_group('Algorithm parameters')
     param.add_argument(
-        '--local-window', type=int, default=1000, metavar='BP',
-        help='Local background window size in bp',
+        '--local-window', type=int, default=10000, metavar='BP',
+        help=(
+            'Local background window size in bp. '
+            'Larger values are more robust for sparse libraries (GUIDE-seq, CIRCLE-seq); '
+            'smaller values track local GC bias better for dense libraries (ATAC-seq).'
+        ),
     )
     param.add_argument(
         '--fragment-size', type=int, default=None, metavar='BP',

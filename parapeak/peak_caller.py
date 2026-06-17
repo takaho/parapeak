@@ -488,18 +488,24 @@ def run_peak_calling(args: Namespace) -> None:
         )
         bw_path = os.path.join(args.output, f'{args.name}_pileup.bw')
         logger.info(
-            f'Writing bigWig pileup (requested bin={args.bigwig_bin} bp, '
-            f'effective bin={effective_bw_bin} bp, subtracting genome mean)'
+            f'Writing bigWig pileup (all bins > genome mean; '
+            f'requested bin={args.bigwig_bin} bp, effective bin={effective_bw_bin} bp)'
         )
-        write_pileup_bigwig(
-            path=bw_path,
-            chrom_pileups=treat_pileups,
-            chrom_sizes=valid_chroms,
-            chrom_order=chrom_order,
-            bin_size=args.bin_size,
-            bigwig_bin=effective_bw_bin,
-            bl_masks=blacklist_masks,
-        )
-        written.append(bw_path)
+        try:
+            write_pileup_bigwig(
+                path=bw_path,
+                chrom_pileups=treat_pileups,
+                chrom_sizes=valid_chroms,
+                chrom_order=chrom_order,
+                bin_size=args.bin_size,
+                bigwig_bin=effective_bw_bin,
+                bl_masks=blacklist_masks,
+            )
+            written.append(bw_path)
+        except ImportError:
+            logger.warning(
+                'pyBigWig is not installed; bigWig output skipped. '
+                'Install it with: pip install pyBigWig'
+            )
 
     logger.info('Written:\n' + '\n'.join(f'  {p}' for p in written))
