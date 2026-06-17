@@ -79,21 +79,36 @@ def write_summit_bed(peaks: List[PeakRecord], path: str) -> None:
 
 
 def write_tsv(peaks: List[PeakRecord], path: str) -> None:
-    """Write detailed TSV with all score columns."""
+    """Write detailed TSV with all score columns.
+
+    Columns
+    -------
+    pileup          : maximum treatment read count at the summit bin
+    p_nb / p_z      : raw p-values from the NB and Z-score tests
+    q_nb / q_z      : BH-corrected q-values (raw, for threshold filtering)
+    -log10(p/q_*)   : same values in -log10 scale (for log-scale visualisation)
+    """
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     header = (
-        'chrom\tstart\tend\tname\tlength\tsummit\t'
+        'chrom\tstart\tend\tname\tlength\tsummit\tpileup\t'
         'fold_enrichment\t'
+        'p_nb\tp_z\tq_nb\tq_z\t'
         '-log10(p_nb)\t-log10(p_z)\t'
         '-log10(q_nb)\t-log10(q_z)\n'
     )
     with open(path, 'w') as fh:
         fh.write(header)
         for pk in peaks:
+            p_nb = 10.0 ** (-pk.neg_log10_pval_nb)
+            p_z  = 10.0 ** (-pk.neg_log10_pval_z)
+            q_nb = 10.0 ** (-pk.neg_log10_qval_nb)
+            q_z  = 10.0 ** (-pk.neg_log10_qval_z)
             fh.write(
                 f'{pk.chrom}\t{pk.start}\t{pk.end}\t{pk.name}\t'
                 f'{pk.length}\t{pk.start + pk.summit_offset}\t'
+                f'{pk.summit_pileup:.2f}\t'
                 f'{pk.fold_enrichment:.4f}\t'
+                f'{p_nb:.4e}\t{p_z:.4e}\t{q_nb:.4e}\t{q_z:.4e}\t'
                 f'{pk.neg_log10_pval_nb:.4f}\t{pk.neg_log10_pval_z:.4f}\t'
                 f'{pk.neg_log10_qval_nb:.4f}\t{pk.neg_log10_qval_z:.4f}\n'
             )

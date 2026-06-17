@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.3.5 (2026-06-17)
+
+### New features
+
+#### `--version` flag (`cli.py`, `__init__.py`, `pyproject.toml`)
+
+`parapeak --version` now prints the version string and exits cleanly.  Previously the flag was
+absent; calling `--version` triggered an argparse error about the required `-t/--treated`
+argument.
+
+Root cause: the package was installed as a regular (non-editable) copy from the local source
+directory (`pip install <path>` rather than `pip install -e <path>`).  The site-packages copy
+retained the old `__version__ = '0.1.0'` from the initial file copy.  Additionally, an empty
+`site-packages/parapeak/` directory left behind by the uninstall was resolved as a namespace
+package, causing `from parapeak import __version__` to fail with *ImportError: cannot import
+name '__version__' from 'parapeak' (unknown location)*.
+
+Fix:
+- Added `from parapeak import __version__` and `parser.add_argument('--version', action='version', ...)`  to `cli.py`.
+- Bumped `__init__.py` and `pyproject.toml` to `0.3.5`.
+- Reinstalled as an editable install (`pip install -e`) and removed the stale empty `site-packages/parapeak/` directory.
+
+#### Raw p-value and q-value columns in TSV output (`output.py`)
+
+The `*_peaks.tsv` file now includes the raw (linear-scale) p-values and q-values alongside
+the existing -log10 columns, making it easier to filter or compare peaks programmatically
+without having to invert the logarithm.
+
+New columns (inserted after the `fold_enrichment` column):
+
+| Column  | Description                                       |
+|---------|---------------------------------------------------|
+| `pileup`| Maximum treatment pileup at the summit bin        |
+| `p_nb`  | Raw p-value from the negative-binomial test       |
+| `p_z`   | Raw p-value from the GC-corrected Z-score test    |
+| `q_nb`  | BH-corrected q-value from the NB test             |
+| `q_z`   | BH-corrected q-value from the Z-score test        |
+
+The existing `-log10(p_nb)`, `-log10(p_z)`, `-log10(q_nb)`, `-log10(q_z)` columns are
+retained so that downstream tools and scripts that relied on them continue to work.
+
+#### Q-value threshold control (`cli.py`, already wired since 0.3.4)
+
+The `-q`/`--qvalue FLOAT` option (default `0.05`) controls the detection threshold.
+Bins must satisfy `q_nb < threshold AND q_z < threshold` (both tests) to be called significant.
+To call more peaks use a looser threshold (e.g. `-q 0.10`); to call fewer peaks use a stricter
+value (e.g. `-q 0.01`).
+
+---
+
 ## 0.3.4 (2026-06-16)
 
 ### Bug fixes

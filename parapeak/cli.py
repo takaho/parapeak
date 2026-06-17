@@ -1,5 +1,7 @@
 import argparse
 
+from parapeak import __version__
+
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -12,6 +14,10 @@ def create_parser() -> argparse.ArgumentParser:
             'BAM files do not need to be sorted or indexed.'
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument(
+        '--version', action='version', version=f'parapeak {__version__}',
     )
 
     inp = parser.add_argument_group('Input')
