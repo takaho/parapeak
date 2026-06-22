@@ -15,6 +15,7 @@ remain fully parallelised across chromosomes.
 import logging
 import math
 import os
+import time
 from argparse import Namespace
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
@@ -45,6 +46,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Stage 2: per-chromosome p-values
 # ---------------------------------------------------------------------------
+
+def _worker_init(n_threads: int) -> None:
+    """Initialise each worker process: cap numba's OpenMP thread pool so that
+    p worker processes × numba_threads do not over-subscribe the CPU."""
+    try:
+        import numba
+        numba.set_num_threads(max(1, n_threads))
+    except Exception:
+        pass
+
 
 def _compute_pvalues_for_chrom(
     chrom_data: Dict[str, Any],
@@ -202,6 +213,7 @@ def run_peak_calling(args: Namespace) -> None:
     """Orchestrate the full peak-calling pipeline."""
     os.makedirs(args.output, exist_ok=True)
     logger.info(f'Output directory: {args.output}')
+    _t0 = time.perf_counter()
 
     # --- genome sizes ---
     all_bams = args.treated + (args.control or [])
@@ -284,6 +296,8 @@ def run_peak_calling(args: Namespace) -> None:
         f'Reads used: treated={treat_total:,}, control={ctrl_total:,}, '
         f'scale_factor={scale_factor:.4f}'
     )
+    _t1 = time.perf_counter()
+    logger.info(f'Stage 1 (BAM read): {_t1 - _t0:.2f} s')
 
     # Assemble per-chromosome data dict
     chrom_results: Dict[str, Dict] = {}
@@ -310,13 +324,29 @@ def run_peak_calling(args: Namespace) -> None:
     gc_centers, gc_mean_depth, gc_var_depth = fit_gc_model(pileup_list, gc_list)
 
     # -----------------------------------------------------------------------
-    # Stage 2: p-values (parallel)
+    # Stages 2–4: single pool spans both parallel stages so worker processes
+    # are spawned once and reused across Stage 2 (p-values) and Stage 4
+    # (peak calling), avoiding a second spawn/teardown cycle.
     # -----------------------------------------------------------------------
-    logger.info('Computing p-values')
     chrom_pvals: Dict[str, Dict] = {}
 
-    with ProcessPoolExecutor(max_workers=args.threads) as pool:
-        futures = {}
+    # Each numba-enabled worker gets 1 internal thread to avoid
+    # p_workers × numba_threads over-subscribing the physical cores.
+    import math as _math
+    cpu_count = os.cpu_count() or 1
+    numba_threads_per_worker = max(1, _math.floor(cpu_count / max(args.threads, 1)))
+
+    with ProcessPoolExecutor(
+        max_workers=args.threads,
+        initializer=_worker_init,
+        initargs=(numba_threads_per_worker,),
+    ) as pool:
+
+        # -------------------------------------------------------------------
+        # Stage 2: p-values (parallel)
+        # -------------------------------------------------------------------
+        logger.info('Computing p-values')
+        futures: Dict = {}
         for chrom, data in chrom_results.items():
             fut = pool.submit(
                 _compute_pvalues_for_chrom,
@@ -333,91 +363,86 @@ def run_peak_calling(args: Namespace) -> None:
             except Exception as exc:
                 logger.warning(f'  P-value computation failed for {chrom}: {exc}')
 
-    # -----------------------------------------------------------------------
-    # Stage 3: BH correction (sequential)
-    # -----------------------------------------------------------------------
-    # We run BH over the non-zero-pileup bins only (zero bins have p = 1 and
-    # never contribute discoveries), but scale the resulting q-values so they
-    # are equivalent to running BH over all genome bins.  This matches the
-    # multiple-testing correction that all-bins BH would apply without the
-    # memory cost of sorting 300 M p-values.
-    #
-    # Scaling: q_all = q_nonzero × (n_total / n_nonzero)
-    # This is equivalent to replacing the BH denominator n_nonzero with
-    # n_total, which is the correct reference set under the global null.
-    logger.info('Applying Benjamini-Hochberg correction')
-    chrom_order = sorted(chrom_pvals.keys())
+        _t2 = time.perf_counter()
+        logger.info(f'Stage 2 (p-values): {_t2 - _t1:.2f} s  [{args.threads} workers]')
 
-    n_total_bins = sum(len(chrom_pvals[c]['p_nb']) for c in chrom_order)
+        # -------------------------------------------------------------------
+        # Stage 3: BH correction (sequential — runs inside pool context so
+        # workers stay alive, ready for Stage 4)
+        # -------------------------------------------------------------------
+        # BH over non-zero-pileup bins only; q-values scaled by
+        # n_total/n_nonzero to match all-bins BH without sorting 300M values.
+        logger.info('Applying Benjamini-Hochberg correction')
+        chrom_order = sorted(chrom_pvals.keys())
 
-    active_masks: Dict[str, np.ndarray] = {}
-    p_nb_active: List[np.ndarray] = []
-    p_z_active:  List[np.ndarray] = []
+        n_total_bins = sum(len(chrom_pvals[c]['p_nb']) for c in chrom_order)
 
-    for c in chrom_order:
-        pv = chrom_pvals[c]
-        active = pv['treat'] > 0
-        active_masks[c] = active
-        p_nb_active.append(pv['p_nb'][active])
-        p_z_active.append(pv['p_z'][active])
+        active_masks: Dict[str, np.ndarray] = {}
+        p_nb_active: List[np.ndarray] = []
+        p_z_active:  List[np.ndarray] = []
 
-    p_nb_concat = np.concatenate(p_nb_active) if p_nb_active else np.array([], dtype=np.float64)
-    p_z_concat  = np.concatenate(p_z_active)  if p_z_active  else np.array([], dtype=np.float64)
-
-    n_nonzero = len(p_nb_concat)
-    bh_scale  = n_total_bins / max(n_nonzero, 1)
-
-    q_nb_concat = np.minimum(benjamini_hochberg(p_nb_concat) * bh_scale, 1.0)
-    q_z_concat  = np.minimum(benjamini_hochberg(p_z_concat)  * bh_scale, 1.0)
-
-    logger.info(
-        f'  BH: {n_nonzero:,} active / {n_total_bins:,} total bins '
-        f'(scale {bh_scale:.1f}x)'
-    )
-
-    pos = 0
-    for c in chrom_order:
-        pv   = chrom_pvals[c]
-        active = active_masks[c]
-        na   = int(active.sum())
-        n    = len(pv['p_nb'])
-
-        q_nb = np.ones(n, dtype=np.float64)
-        q_z  = np.ones(n, dtype=np.float64)
-        if na > 0:
-            q_nb[active] = q_nb_concat[pos:pos + na]
-            q_z[active]  = q_z_concat[pos:pos + na]
-        pv['q_nb'] = q_nb
-        pv['q_z']  = q_z
-        pos += na
-
-    # -----------------------------------------------------------------------
-    # Stage 4: peak calling (parallel)
-    # -----------------------------------------------------------------------
-    # When no control was provided, ctrl == treat and fold enrichment would
-    # always be 1.0, causing every peak to fail the min_fold filter.
-    # Replace ctrl with a flat genome-mean array so fold enrichment reflects
-    # enrichment above the genome-wide background.  The NB p-values have
-    # already been computed, so this only affects fold enrichment in Stage 4.
-    if not args.control:
-        total_reads = sum(float(np.sum(chrom_pvals[c]['treat'])) for c in chrom_order)
-        total_bins  = sum(len(chrom_pvals[c]['treat'])           for c in chrom_order)
-        genome_mean = total_reads / max(total_bins, 1)
-        logger.info(f'No control: using genome mean {genome_mean:.4f} as fold-enrichment baseline')
         for c in chrom_order:
-            n = len(chrom_pvals[c]['ctrl'])
-            chrom_pvals[c]['ctrl'] = np.full(n, genome_mean, dtype=np.float64)
+            pv = chrom_pvals[c]
+            active = pv['treat'] > 0
+            active_masks[c] = active
+            p_nb_active.append(pv['p_nb'][active])
+            p_z_active.append(pv['p_z'][active])
 
-    logger.info('Calling peaks')
-    all_peaks: List[PeakRecord] = []
+        p_nb_concat = np.concatenate(p_nb_active) if p_nb_active else np.array([], dtype=np.float64)
+        p_z_concat  = np.concatenate(p_z_active)  if p_z_active  else np.array([], dtype=np.float64)
 
-    chrom_peak_offset: Dict[str, int] = {}
-    cumulative = 0
-    for c in chrom_order:
-        chrom_peak_offset[c] = cumulative
-        cumulative += 10_000
+        n_nonzero = len(p_nb_concat)
+        bh_scale  = n_total_bins / max(n_nonzero, 1)
 
-    with ProcessPoolExecutor(max_workers=args.threads) as pool:
+        q_nb_concat = np.minimum(benjamini_hochberg(p_nb_concat) * bh_scale, 1.0)
+        q_z_concat  = np.minimum(benjamini_hochberg(p_z_concat)  * bh_scale, 1.0)
+
+        logger.info(
+            f'  BH: {n_nonzero:,} active / {n_total_bins:,} total bins '
+            f'(scale {bh_scale:.1f}x)'
+        )
+        _t3 = time.perf_counter()
+        logger.info(f'Stage 3 (BH correction): {_t3 - _t2:.2f} s')
+
+        pos = 0
+        for c in chrom_order:
+            pv     = chrom_pvals[c]
+            active = active_masks[c]
+            na     = int(active.sum())
+            n      = len(pv['p_nb'])
+            q_nb   = np.ones(n, dtype=np.float64)
+            q_z    = np.ones(n, dtype=np.float64)
+            if na > 0:
+                q_nb[active] = q_nb_concat[pos:pos + na]
+                q_z[active]  = q_z_concat[pos:pos + na]
+            pv['q_nb'] = q_nb
+            pv['q_z']  = q_z
+            pos += na
+
+        # -------------------------------------------------------------------
+        # Stage 4: peak calling (parallel — reuses the same pool)
+        # -------------------------------------------------------------------
+        # In no-control mode ctrl == treat → fold enrichment is always 1.0.
+        # Replace ctrl with a genome-mean flat array so fold enrichment
+        # reflects enrichment above the genome-wide background.
+        if not args.control:
+            total_reads = sum(float(np.sum(chrom_pvals[c]['treat'])) for c in chrom_order)
+            total_bins  = sum(len(chrom_pvals[c]['treat'])           for c in chrom_order)
+            genome_mean = total_reads / max(total_bins, 1)
+            logger.info(f'No control: using genome mean {genome_mean:.4f} as fold-enrichment baseline')
+            for c in chrom_order:
+                n = len(chrom_pvals[c]['ctrl'])
+                chrom_pvals[c]['ctrl'] = np.full(n, genome_mean, dtype=np.float64)
+
+        logger.info('Calling peaks')
+        all_peaks: List[PeakRecord] = []
+
+        chrom_peak_offset: Dict[str, int] = {}
+        cumulative = 0
+        for c in chrom_order:
+            chrom_peak_offset[c] = cumulative
+            cumulative += 10_000
+
         futures = {}
         for c in chrom_order:
             pv = chrom_pvals[c]
@@ -454,6 +479,8 @@ def run_peak_calling(args: Namespace) -> None:
                 logger.warning(f'  Peak calling failed for {c}: {exc}')
 
     all_peaks.sort(key=lambda pk: (pk.chrom, pk.start))
+    _t4 = time.perf_counter()
+    logger.info(f'Stage 4 (peak calling): {_t4 - _t3:.2f} s  [{args.threads} workers]')
     logger.info(f'Total peaks called: {len(all_peaks)}')
 
     # -----------------------------------------------------------------------
@@ -509,3 +536,4 @@ def run_peak_calling(args: Namespace) -> None:
             )
 
     logger.info('Written:\n' + '\n'.join(f'  {p}' for p in written))
+    logger.info(f'Total pipeline: {time.perf_counter() - _t0:.2f} s')
