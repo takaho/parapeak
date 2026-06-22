@@ -446,9 +446,11 @@ global over- or under-estimation of expected depth).
 ```
 Main process:
   Stage 1 (sequential): reads all BAM files, fills per-chrom arrays
-  Stage 2 (pool.submit for each chrom): dispatches p-value workers
-  Stage 3 (sequential): joins workers, pools p-values, runs BH
-  Stage 4 (pool.submit for each chrom): dispatches peak-calling workers
+  ┌─ ProcessPoolExecutor (single pool for Stages 2 and 4) ─────────────────┐
+  │  Stage 2 (pool.submit per chrom): dispatches p-value workers           │
+  │  Stage 3 (sequential, inside pool context): BH correction              │
+  │  Stage 4 (pool.submit per chrom): dispatches peak-calling workers      │
+  └────────────────────────────────────────────────────────────────────────┘
   Write output files
 
 Worker processes:
@@ -457,11 +459,33 @@ Worker processes:
   Results (p-value arrays / peak lists) are returned via the result channel.
 ```
 
+**Single shared pool**: Stages 2 and 4 reuse the same `ProcessPoolExecutor` so
+worker processes are spawned once.  A second spawn/teardown cycle (and the
+associated Python import + numba JIT-cache load time per worker) is avoided.
+
+**Numba thread cap**: each worker's internal thread count is set to
+`floor(cpu_count / n_workers)` at startup.  Without this cap, `p` workers each
+start `cpu_count` OpenMP threads for numba's `@njit(parallel=True)` loops,
+totalling `p × cpu_count` threads on a machine with `cpu_count` physical cores.
+
 Worker count is set by `-p / --threads`.  The practical upper bound is the number
 of chromosomes (typically 25 for hg38), beyond which additional workers are idle.
 
 Memory per worker ≈ 2 × n_bins × 4 bytes (two float32 arrays: treat and ctrl).
 For hg38 at 10 bp resolution: 2 × 30 M × 4 ≈ 240 MB per worker.
+
+Empirical scaling on BINDS122/S1.bam (46k reads, hg38, MiSeq depth):
+
+| -p | Wall time | Speedup |
+|---:|---:|---:|
+| 1 | 57.5 s | 1.00× |
+| 2 | 41.9 s | 1.37× |
+| 4 | 41.2 s | 1.39× |
+
+Scaling is limited by: (1) sequential stages (Stage 1 + Stage 3 = 16% of runtime,
+Amdahl ceiling 2.72× at p=4); (2) IPC serialisation of ~27 GB of numpy arrays
+across all chromosomes; (3) work imbalance (chr1 is ~20× larger than chr22).
+See `docs/benchmark.md` for the full analysis.
 
 ---
 
@@ -473,6 +497,7 @@ For hg38 at 10 bp resolution: 2 × 30 M × 4 ≈ 240 MB per worker.
 | BAM input | Sorted + indexed required | Single pass, no sort/index needed |
 | Statistical model | Poisson | NB + GC-corrected Z-score (both required) |
 | Background model | max(lambda_BG, lambda_1k, lambda_10k) | max(lambda_global_NB, lambda_local_Poisson) |
+| Local window | d / 1 kb / 10 kb (max of three) | single `--local-window` (default 10 kb) |
 | Duplicate handling | `--keep-dup` (coord-based, default 1) | `--keep-dup` (coord-based, default 1) |
 | GC correction | Not built-in | Built-in, reference-free |
 | Genome size | User-supplied `--gsize` | Inferred from BAM headers |
@@ -481,7 +506,25 @@ For hg38 at 10 bp resolution: 2 × 30 M × 4 ≈ 240 MB per worker.
 | Broken BAM headers | Error | Auto-repaired |
 
 The `max(lambda_local_Poisson, lambda_global_NB)` design in parapeak has the same
-intent as MACS3's `max(lambda_BG, lambda_local)` but uses a single local window
-(`--local-window`, default 1000 bp) rather than MACS3's trio of windows (d, 1k, 10k).
-For ATAC-seq and cut-site assays, setting `--local-window 10000` aligns the
-two algorithms more closely.
+intent as MACS3's `max(lambda_BG, lambda_local)` but uses a single configurable
+local window (`--local-window`, default 10 kb) rather than MACS3's trio of windows
+(d, 1k, 10k).
+
+**Measured concordance on BINDS122/S1.bam** (GUIDE-seq, hg38, no-control mode,
+`--fragment-size 100 --local-window 10000 -q 0.05`):
+
+| Metric | Value |
+|---|---:|
+| parapeak peaks | 291 |
+| MACS3 peaks | 209 |
+| Recall — MACS3 peaks recovered by parapeak | **73.7%** (154/209) |
+| Precision — parapeak peaks overlapping MACS3 | **52.6%** (153/291) |
+| F1 | **0.614** |
+| Jaccard (bp) | **0.203** |
+
+parapeak recovers ~74% of MACS3 peaks and calls ~40% more peaks overall.  The extra
+peaks reflect the GC-corrected Z-score test detecting enrichments that the single
+Poisson model misses, though some may be false positives at the default threshold.
+Use `-q 0.01` or `--min-count 8` for a more conservative call set.
+
+For the full benchmark analysis see `docs/benchmark.md`.
